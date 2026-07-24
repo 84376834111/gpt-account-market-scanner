@@ -1,0 +1,19 @@
+[Unit]
+Description=Resolve and import Telegram LDXP links once upstream is available
+After=network-online.target ldxp-scanner.service
+Wants=network-online.target
+ConditionPathExists=!/var/lib/ldxp-scanner/telegram-import/complete.marker
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/ldxp-scanner.env
+WorkingDirectory=/var/lib/ldxp-scanner/telegram-import
+ExecStart=/usr/bin/python3 /var/lib/ldxp-scanner/telegram-import/telegram_import_worker.py /var/lib/ldxp-scanner/telegram-import/telegram_ldxp_links.json --app-dir /opt/ldxp-scanner --resolver /var/lib/ldxp-scanner/telegram-import/telegram_resolve.py --output /var/lib/ldxp-scanner/telegram-import/import-report.json --interval 1 --attempts 1
+ExecStartPost=/usr/bin/touch /var/lib/ldxp-scanner/telegram-import/complete.marker
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/ldxp-scanner

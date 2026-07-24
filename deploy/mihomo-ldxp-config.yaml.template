@@ -1,0 +1,73 @@
+# Mihomo configuration: use DIRECT for everything except an LDXP-only
+# availability fallback. The subscription URL is inserted during deployment.
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+ipv6: false
+
+listeners:
+  - name: "ldxp-rotating-node-in"
+    type: mixed
+    listen: 127.0.0.1
+    port: 7891
+    proxy: LDXP-ROTATE
+    users: []
+
+proxy-providers:
+  ldxp-subscription:
+    type: http
+    url: __SUBSCRIPTION_URL_JSON__
+    path: ./providers/ldxp-subscription.yaml
+    interval: 3600
+    header:
+      User-Agent:
+        - "mihomo/1.19.29"
+    exclude-filter: "(?i)剩余流量|距离下次重置|套餐到期|traffic|expire|reset"
+    health-check:
+      enable: true
+      url: "https://pay.ldxp.cn/"
+      interval: 60
+      timeout: 5000
+      lazy: false
+
+proxy-groups:
+  - name: "LDXP-NODES"
+    type: url-test
+    use:
+      - ldxp-subscription
+    url: "https://pay.ldxp.cn/"
+    interval: 60
+    timeout: 5000
+    lazy: false
+    tolerance: 50
+    max-failed-times: 1
+
+  - name: "LDXP-ROTATE"
+    type: load-balance
+    proxies:
+      - DIRECT
+    use:
+      - ldxp-subscription
+    strategy: round-robin
+    url: "https://pay.ldxp.cn/"
+    interval: 60
+    timeout: 5000
+    lazy: false
+    max-failed-times: 1
+
+  - name: "LDXP-DIRECT-FALLBACK"
+    type: fallback
+    proxies:
+      - DIRECT
+      - LDXP-NODES
+    url: "https://pay.ldxp.cn/"
+    interval: 60
+    timeout: 5000
+    lazy: false
+    max-failed-times: 1
+
+rules:
+  - DOMAIN-SUFFIX,ldxp.cn,LDXP-DIRECT-FALLBACK
+  - MATCH,DIRECT

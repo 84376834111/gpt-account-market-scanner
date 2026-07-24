@@ -1,0 +1,25 @@
+[Unit]
+Description=LDXP public shop price scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ldxp-scanner
+EnvironmentFile=/etc/ldxp-scanner.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/ldxp-scanner/app.py
+Restart=on-failure
+RestartSec=5
+StateDirectory=ldxp-scanner
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/ldxp-scanner
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

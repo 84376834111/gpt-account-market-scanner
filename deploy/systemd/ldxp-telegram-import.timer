@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry Telegram LDXP import every two minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=2min
+AccuracySec=10s
+Persistent=true
+Unit=ldxp-telegram-import.service
+
+[Install]
+WantedBy=timers.target

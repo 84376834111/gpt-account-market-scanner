@@ -1,0 +1,32 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime state and local secrets
+data/
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated research and validation output
+artifacts/
+ldxp_*.js
+
+# Local agent, editor, and operating-system files
+.agents/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
