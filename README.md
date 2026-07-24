@@ -94,13 +94,13 @@ python -m unittest discover -s tests -v
 适用于全新的 Ubuntu/Debian 主机。脚本会安装 `git`、`python3` 和证书包，将源码检出到 `/opt/ldxp-scanner-source`，再创建并启动 `ldxp-scanner` 专用服务账户。默认只监听 `127.0.0.1:8765`，不会自动公开端口。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/84376834111/gpt-/main/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/84376834111/gpt-account-market-scanner/main/deploy/bootstrap.sh | sudo bash
 ```
 
 如需接入已有 Nginx 站点，明确传入该机器的站点配置路径和公开地址：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/84376834111/gpt-/main/deploy/bootstrap.sh | \
+curl -fsSL https://raw.githubusercontent.com/84376834111/gpt-account-market-scanner/main/deploy/bootstrap.sh | \
   sudo env \
     LDXP_NGINX_SITE=/etc/nginx/sites-available/example.com \
     LDXP_PUBLIC_URL=https://example.com/ldxp/ \

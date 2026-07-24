@@ -2,7 +2,7 @@
 # Install or update LDXP Scanner from a clean Ubuntu host.
 set -euo pipefail
 
-REPOSITORY="${LDXP_REPOSITORY:-https://github.com/84376834111/gpt-.git}"
+REPOSITORY="${LDXP_REPOSITORY:-https://github.com/84376834111/gpt-account-market-scanner.git}"
 REF="${LDXP_REF:-main}"
 SOURCE_DIR="${LDXP_SOURCE_DIR:-/opt/ldxp-scanner-source}"
 
