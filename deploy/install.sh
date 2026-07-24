@@ -4,6 +4,8 @@ set -euo pipefail
 SOURCE_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 APP_DIR=/opt/ldxp-scanner
 ENV_FILE=/etc/ldxp-scanner.env
+STATE_DIR=/var/lib/ldxp-scanner
+SERVICE_USER=ldxp-scanner
 NGINX_SITE="${LDXP_NGINX_SITE:-}"
 PUBLIC_URL="${LDXP_PUBLIC_URL:-http://127.0.0.1:8765/}"
 SNIPPET="$SOURCE_DIR/deploy/nginx-location.conf"
@@ -13,7 +15,14 @@ if [[ ! -f "$SOURCE_DIR/app.py" || ! -f "$SNIPPET" ]]; then
   exit 1
 fi
 
+if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+  sudo useradd --system --user-group --home-dir "$STATE_DIR" \
+    --shell /usr/sbin/nologin "$SERVICE_USER"
+fi
+
 sudo install -d -o root -g root -m 0755 "$APP_DIR" "$APP_DIR/static"
+sudo install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR"
+sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR"
 sudo install -o root -g root -m 0644 "$SOURCE_DIR/app.py" "$APP_DIR/app.py"
 sudo install -o root -g root -m 0644 "$SOURCE_DIR/static/index.html" "$APP_DIR/static/index.html"
 sudo install -o root -g root -m 0644 "$SOURCE_DIR/static/style.css" "$APP_DIR/static/style.css"

@@ -2,6 +2,10 @@
 
 一个面向 `pay.ldxp.cn` 和 `catfk.com` 公开店铺的轻量比价看板。服务端定时采集商品名称、价格和库存，按关键词分类，并通过 SSE 将结果逐条推送到网页，扫描期间不会阻塞页面。
 
+## 界面预览
+
+![LDXP 扫货台界面预览](docs/images/dashboard.png)
+
 ## 功能
 
 - 内置 Plus、GPT Free/非 Plus、Team、Pro、K12、Cursor、Codex、Claude、Kiro、Gemini、邮箱、接码等关键词；Plus 与非 Plus 账号会进一步按已接码、未接码拆分。
@@ -67,7 +71,27 @@ LDXP 的公开首页没有全站商品目录。每个公开店铺由 `/shop/{tok
 python -m unittest discover -s tests -v
 ```
 
-## Ubuntu 部署
+## Ubuntu 一键部署
+
+适用于全新的 Ubuntu/Debian 主机。脚本会安装 `git`、`python3` 和证书包，将源码检出到 `/opt/ldxp-scanner-source`，再创建并启动 `ldxp-scanner` 专用服务账户。默认只监听 `127.0.0.1:8765`，不会自动公开端口。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/84376834111/gpt-/main/deploy/bootstrap.sh | sudo bash
+```
+
+如需接入已有 Nginx 站点，明确传入该机器的站点配置路径和公开地址：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/84376834111/gpt-/main/deploy/bootstrap.sh | \
+  sudo env \
+    LDXP_NGINX_SITE=/etc/nginx/sites-available/example.com \
+    LDXP_PUBLIC_URL=https://example.com/ldxp/ \
+    bash
+```
+
+可通过 `LDXP_REPOSITORY`、`LDXP_REF` 和 `LDXP_SOURCE_DIR` 覆盖源码仓库、分支和检出目录。更新时脚本只会更新来源一致且没有本地改动的检出目录。
+
+## 手动 Ubuntu 部署
 
 systemd 与 Nginx 部署文件位于 `deploy/`。安装脚本默认只启动本机 `127.0.0.1:8765` 服务；如需把 `/ldxp/` 注入已有 Nginx 站点，显式传入该机器上的私有配置路径：
 
