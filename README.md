@@ -16,24 +16,6 @@
 - 服务器手动扫描和自动调度只允许在服务器后台控制，网页不暴露主动扫描、暂停或开启自动扫描入口。
 - 手机和桌面端自适应，无前端或 Python 第三方依赖。
 
-## 推荐中转站
-
-以下为作者当前的个人使用反馈：两家均为服务商自行搓号的一手号来源，日常使用稳定。它们均为第三方服务，请在使用前自行评估服务条款、账号安全和可用性。
-
-### [ai.hyperai.icu](https://ai.hyperai.icu)
-
-- 推荐分组：低价 GPT 混池
-- 当前倍率：`0.1x`
-
-![ai.hyperai.icu 低价 GPT 混池倍率](docs/images/hyperai-pricing.png)
-
-### [api.zyzy111.xyz](https://api.zyzy111.xyz)
-
-- 推荐分组：混池 `0.1x`
-- 当前倍率：`0.1x`
-
-![api.zyzy111.xyz 混池倍率](docs/images/zyzy-pricing.png)
-
 ## 本地运行
 
 ```powershell
@@ -129,3 +111,21 @@ sudo env \
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。
+
+## 推荐中转站
+
+以下为作者当前的个人使用反馈：两家均为服务商自行搓号的一手号来源，日常使用稳定。它们均为第三方服务，请在使用前自行评估服务条款、账号安全和可用性。
+
+### [ai.hyperai.icu](https://ai.hyperai.icu)
+
+- 推荐分组：低价 GPT 混池
+- 当前倍率：`0.1x`
+
+![ai.hyperai.icu 低价 GPT 混池倍率](docs/images/hyperai-pricing.png)
+
+### [api.zyzy111.xyz](https://api.zyzy111.xyz)
+
+- 推荐分组：混池 `0.1x`
+- 当前倍率：`0.1x`
+
+![api.zyzy111.xyz 混池倍率](docs/images/zyzy-pricing.png)
