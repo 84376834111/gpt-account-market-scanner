@@ -43,6 +43,7 @@ const state = {
   proxyOnlyScanning: false,
   priceaiSyncStarting: false,
   priceaiSyncing: false,
+  submittedSourceToken: '',
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -69,6 +70,7 @@ const elements = {
   priceMin: $('#priceMin'), priceMax: $('#priceMax'), includeMinPrice: $('#includeMinPrice'),
   loadMore: $('#loadMoreProducts'), loadMoreButton: $('#loadMoreButton'),
   loadBatchSize: $('#loadBatchSize'), loadMoreStatus: $('#loadMoreStatus'),
+  sourceImportProgress: $('#sourceImportProgress'), sourceImportProgressText: $('#sourceImportProgressText'),
 };
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
@@ -93,6 +95,21 @@ function toast(message, error = false) {
   toast.timer = setTimeout(() => { elements.toast.className = 'toast'; }, 2800);
 }
 
+function setSourceImportProgress(token, message, status = 'running') {
+  if (!elements.sourceImportProgress || !elements.sourceImportProgressText) return;
+  if (token) state.submittedSourceToken = token;
+  elements.sourceImportProgress.hidden = false;
+  elements.sourceImportProgress.dataset.status = status;
+  elements.sourceImportProgressText.textContent = message;
+  clearTimeout(setSourceImportProgress.timer);
+  if (status === 'done' || status === 'error') {
+    setSourceImportProgress.timer = setTimeout(() => {
+      elements.sourceImportProgress.hidden = true;
+      state.submittedSourceToken = '';
+    }, 5000);
+  }
+}
+
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
@@ -115,6 +132,7 @@ async function loadState() {
     void reloadProducts();
   }
   try {
+    const renderedCatalogRevision = state.catalogRevision;
     const payload = await api('api/state');
     state.sources = payload.sources || [];
     state.categories = payload.categories || [];
@@ -128,7 +146,12 @@ async function loadState() {
     updateStats();
     renderTabs();
     renderSources();
-    if (!initialLoad) await reloadProducts();
+    if (!initialLoad) {
+      await reloadProducts();
+    } else if (renderedCatalogRevision && renderedCatalogRevision !== state.catalogRevision) {
+      // A cache from before a source scan must not keep displaying an empty result set.
+      void reloadProducts();
+    }
     setScanning(state.scanning, state.scanning ? '正在采集公开店铺' : '自动扫描已关闭');
   } catch (error) {
     toast(error.message, true);
@@ -242,6 +265,31 @@ function currentFilterMappingKey() {
     include_min: state.includeMinPrice,
     search: state.search.trim().toLocaleLowerCase(),
   });
+}
+
+function isMarketplaceLinkSearch(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return ['pay.ldxp.cn', 'www.ldxp.cn', 'catfk.com', 'www.catfk.com'].includes(url.hostname)
+      && /^\/(shop|item)\//i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function searchTargetsSource(value, sourceToken) {
+  try {
+    const url = new URL(String(value || '').trim());
+    const parts = url.pathname.split('/').filter(Boolean);
+    if (parts.length < 2 || parts.at(-2)?.toLowerCase() !== 'shop') return false;
+    const remoteToken = decodeURIComponent(parts.at(-1) || '');
+    const sourceKey = ['catfk.com', 'www.catfk.com'].includes(url.hostname)
+      ? `catfk.com:${remoteToken}`
+      : remoteToken;
+    return sourceKey === sourceToken;
+  } catch {
+    return false;
+  }
 }
 
 async function readProductStream(params, onRecord) {
@@ -392,7 +440,10 @@ async function loadProductBatch() {
   updateProductLoadingControls();
   try {
     const cached = readCachedProductPage(query);
-    if (cached) {
+    const cachedMeta = cached?.find((record) => record.type === 'meta');
+    const cachedRevision = Number(cachedMeta?.catalog_revision || 0);
+    const hasSearch = Boolean(state.search.trim());
+    if (cached && !hasSearch && (!state.catalogRevision || cachedRevision === state.catalogRevision)) {
       cached.forEach((record) => applyProductStreamRecord(record, requestId, offset));
       if (state.streamRenderQueued) flushStreamedProducts();
       const visibleKeys = cached
@@ -843,6 +894,16 @@ function connectEvents() {
     if (payload.phase === 'completed') state.proxyOnlyScanning = false;
     if (payload.phase === 'started') clearRefreshingTags();
     if (payload.phase === 'completed') setTimeout(clearRefreshingTags, 300);
+    if (state.submittedSourceToken && payload.token === state.submittedSourceToken) {
+      if (payload.phase === 'source_started') {
+        setSourceImportProgress(payload.token, 'Scanning shop products...', 'running');
+      } else if (payload.phase === 'source_completed') {
+        setSourceImportProgress(payload.token, `Refresh complete: ${Number(payload.matched || 0)} products found.`, 'done');
+        if (searchTargetsSource(state.search, payload.token)) void reloadProducts();
+      } else if (payload.phase === 'source_error') {
+        setSourceImportProgress(payload.token, `Refresh failed: ${payload.error || 'unknown error'}`, 'error');
+      }
+    }
     setScanning(Boolean(payload.scanning), scanMessage(payload));
   });
   stream.addEventListener('snapshot', (event) => {
@@ -1092,10 +1153,80 @@ async function refreshProduct(goodsKey) {
   }
 }
 
+async function refreshProductWithLocalIp(goodsKey) {
+  if (!goodsKey || state.refreshingProducts.has(goodsKey) || state.localScanning) return;
+  const product = state.products.get(goodsKey);
+  const configuredSource = state.sources.find((item) => item.token === product?.source_token);
+  const source = configuredSource || fallbackLocalSource(product);
+  if (product?.source_token === 'priceai.cc:top5' || source?.source_kind === 'snapshot') {
+    try {
+      const result = await api(`api/products/${encodeURIComponent(goodsKey)}/priceai-refresh`, {
+        method: 'POST',
+      });
+      toast(result.started ? 'PriceAI snapshot refresh started.' : 'PriceAI snapshot refresh is already running.');
+    } catch (error) {
+      toast(`PriceAI refresh failed: ${error.message}`, true);
+    }
+    return;
+  }
+  if (!product || !source || source.source_kind !== 'shop_api') {
+    toast('This product cannot be refreshed from a local shop API.', true);
+    return;
+  }
+
+  setProductRefreshing(goodsKey, true);
+  setLocalScanning(true, `Refreshing ${product.name} through this device`, '1 / 1', 'filter');
+  try {
+    const item = await localMarketplacePost(
+      sourceBaseUrl(source),
+      '/shopApi/Shop/goodsInfo',
+      { goods_key: product.goods_key },
+    );
+    if (!item?.goods_key) throw new Error('The shop API did not return this product.');
+    const result = await api('api/local-scan/products', {
+      method: 'POST',
+      body: JSON.stringify({
+        token: source.token,
+        source_name: product.source_name || source.name || source.token,
+        items: [compactLocalItem(item, item.goods_type || product.goods_type || '')],
+        requested_keys: [product.goods_key],
+      }),
+    });
+    await refreshVisibleProducts([product.goods_key], state.productRequestId);
+    toast(result.changed ? 'Product refreshed through this device.' : 'Product information is already current.');
+  } catch (error) {
+    toast(`Local refresh failed: ${error.message}`, true);
+  } finally {
+    setProductRefreshing(goodsKey, false);
+    setLocalScanning(false, state.autoScanEnabled ? 'Automatic scanning is enabled.' : 'Automatic scanning is paused.', '', 'filter');
+  }
+}
+
 const LOCAL_LDXP_BASE_URL = 'https://pay.ldxp.cn';
 const LOCAL_GOODS_TYPES = ['card', 'article', 'resource', 'equity'];
 const LOCAL_PAGE_SIZE = 300;
 const LOCAL_MAX_PAGES = 20;
+
+function fallbackLocalSource(product) {
+  const token = String(product?.source_token || '');
+  if (!token || token.startsWith('priceai.')) return null;
+  if (token.startsWith('catfk.com:')) {
+    return {
+      token,
+      source_kind: 'shop_api',
+      base_url: 'https://catfk.com',
+      remote_token: token.slice('catfk.com:'.length),
+      name: product.source_name || token,
+    };
+  }
+  return {
+    token,
+    source_kind: 'shop_api',
+    base_url: LOCAL_LDXP_BASE_URL,
+    remote_token: token,
+    name: product.source_name || token,
+  };
+}
 
 function sourceBaseUrl(source) {
   return String(source?.base_url || LOCAL_LDXP_BASE_URL).replace(/\/$/, '');
@@ -1480,7 +1611,7 @@ document.addEventListener('click', (event) => {
   if (refreshButton) {
     event.preventDefault();
     event.stopPropagation();
-    refreshProduct(refreshButton.closest('.product-card')?.dataset.key);
+    refreshProductWithLocalIp(refreshButton.closest('.product-card')?.dataset.key);
     return;
   }
   const tab = event.target.closest('[data-category]');
@@ -1504,6 +1635,10 @@ document.addEventListener('click', (event) => {
 
 $('#searchInput').addEventListener('input', (event) => {
   state.search = event.target.value;
+  if (isMarketplaceLinkSearch(state.search) && state.stockOnly) {
+    state.stockOnly = false;
+    $('#stockOnly').checked = false;
+  }
   clearTimeout(searchReloadTimer);
   searchReloadTimer = setTimeout(() => renderProducts(), 220);
 });
@@ -1550,10 +1685,23 @@ $('#addSourceForm').addEventListener('submit', async (event) => {
       body: JSON.stringify({ source: elements.sourceInput.value.trim() }),
     });
     elements.sourceInput.value = '';
+    if (result.source?.token) {
+      setSourceImportProgress(
+        result.source.token,
+        result.scan_queued ? 'Added to the refresh queue...' : 'Source added.',
+        'running',
+      );
+    }
     toast(result.scan_queued ? '采集源已加入，服务器正在扫描' : '采集源已加入，等待服务器扫描');
     const payload = await api('api/state');
     state.sources = payload.sources || [];
     state.stats = payload.stats || state.stats;
+    const importedSource = state.sources.find((source) => source.token === state.submittedSourceToken);
+    if (importedSource?.status === 'ok') {
+      setSourceImportProgress(importedSource.token, `Refresh complete: ${Number(importedSource.product_count || 0)} products found.`, 'done');
+    } else if (importedSource?.status === 'error') {
+      setSourceImportProgress(importedSource.token, `Refresh failed: ${importedSource.last_error || 'unknown error'}`, 'error');
+    }
     renderSources(); updateStats();
   } catch (error) { toast(error.message, true); }
 });

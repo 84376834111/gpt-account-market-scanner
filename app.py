@@ -3643,6 +3643,19 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
+        priceai_refresh_prefix = "/api/products/"
+        priceai_refresh_suffix = "/priceai-refresh"
+        if path.startswith(priceai_refresh_prefix) and path.endswith(priceai_refresh_suffix):
+            goods_key = urllib.parse.unquote(
+                path[len(priceai_refresh_prefix) : -len(priceai_refresh_suffix)]
+            ).strip()
+            product = self.app.database.get_product(goods_key)
+            if product is None or str(product.get("source_token")) != PRICEAI_SOURCE_TOKEN:
+                self._error(HTTPStatus.BAD_REQUEST, "not a PriceAI product")
+                return
+            started = self.app.scanner.trigger_priceai_sync()
+            self._send_json({"ok": True, "started": started}, HTTPStatus.ACCEPTED)
+            return
         if path == "/api/admin/verify":
             if not self._require_admin():
                 return

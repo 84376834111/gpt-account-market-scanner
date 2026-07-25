@@ -43,6 +43,12 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .stream-status.online i { background: var(--green); box-shadow: 0 0 0 4px #19a97420; }
 .stream-status.error i { background: var(--red); box-shadow: 0 0 0 4px #de5a5a20; }
 .visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.source-import-progress { position: fixed; right: 24px; bottom: 24px; z-index: 30; width: min(320px, calc(100vw - 32px)); padding: 13px 15px; color: var(--ink); border: 1px solid #bfd3c7; border-radius: 8px; background: #f8fffb; box-shadow: 0 12px 30px #15271d24; }
+.source-import-progress strong, .source-import-progress span { display: block; }
+.source-import-progress strong { color: #167051; font-size: 12px; }
+.source-import-progress span { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.source-import-progress[data-status="error"] { border-color: #e7baba; background: #fffafa; }
+.source-import-progress[data-status="error"] strong { color: #b63d3d; }
 
 .stats { display: grid; grid-template-columns: minmax(250px, 1.35fr) repeat(4, minmax(125px, 1fr)); overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: #ffffffdf; box-shadow: 0 14px 42px #1c29490a; backdrop-filter: blur(12px); }
 .brand-summary { min-width: 0; min-height: 108px; display: flex; align-items: flex-start; gap: 14px; padding: 20px 26px; color: inherit; border-right: 1px solid var(--line); }
