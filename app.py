@@ -225,6 +225,15 @@ SEED_SOURCES = {
     "zhaoyang": "自动发现：爱比价社区",
     "D92VW084": "自动发现：爱比价社区",
 }
+SEED_SOURCES.update(
+    {
+        "8PYPONF6": "public submission",
+        "RVJW3W82": "public submission",
+        "CA1AHXEC": "public submission",
+        "DVUZF77R": "public submission",
+    }
+)
+
 GOODS_TYPES = ("card", "article", "resource", "equity")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{2,64}$")
 SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]{2,64}$")

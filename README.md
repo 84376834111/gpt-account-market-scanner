@@ -116,7 +116,7 @@ sudo env \
 
 ## 商铺链接清单
 
-当前采集到的公开商铺链接位于 [docs/shop-links.txt](docs/shop-links.txt)，共 679 条，供检索、去重或补充采集源时参考。
+当前采集到的公开商铺链接位于 [docs/shop-links.txt](docs/shop-links.txt)，共 681 条，供检索、去重或补充采集源时参考。
 
 ## 推荐中转站
 
