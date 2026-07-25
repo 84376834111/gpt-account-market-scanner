@@ -672,6 +672,30 @@ class DatabaseTests(unittest.TestCase):
         thread.return_value.start.assert_called_once()
         service._finish_scan()
 
+    def test_queues_one_server_scan_for_a_newly_submitted_source(self):
+        service = ScannerService(self.db, EventHub(), auto_scan_enabled=False)
+        with patch("app.threading.Thread") as thread:
+            self.assertTrue(service.request_submitted_source_scan("demo"))
+            self.assertFalse(service.request_submitted_source_scan("demo"))
+
+        self.assertEqual(service._submitted_source_scan_queue.qsize(), 1)
+        thread.assert_called_once()
+        thread.return_value.start.assert_called_once()
+
+    def test_submitted_source_scan_uses_the_server_scanner(self):
+        service = ScannerService(self.db, EventHub(), auto_scan_enabled=False)
+        service._submitted_source_scan_queue.put("demo")
+        service._submitted_source_scan_tokens.add("demo")
+        with (
+            patch.object(service, "_scan_source", return_value=(3, 2)) as scan_source,
+            patch.object(service, "_publish_snapshot") as publish_snapshot,
+        ):
+            service._process_submitted_source_scans()
+
+        scan_source.assert_called_once_with("demo")
+        publish_snapshot.assert_called_once()
+        self.assertFalse(service._submitted_source_scan_tokens)
+
     def test_disabled_auto_scan_starts_control_thread_for_runtime_enable(self):
         service = ScannerService(self.db, EventHub(), auto_scan_enabled=False)
         with patch("app.threading.Thread") as thread:

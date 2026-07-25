@@ -1501,12 +1501,12 @@ $('#sourceButton').addEventListener('click', () => openSources());
 $('#addSourceForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {
-    await api('api/sources', {
+    const result = await api('api/sources', {
       method: 'POST',
       body: JSON.stringify({ source: elements.sourceInput.value.trim() }),
     });
     elements.sourceInput.value = '';
-    toast('采集源已加入，可使用本地扫描刷新');
+    toast(result.scan_queued ? '采集源已加入，服务器正在扫描' : '采集源已加入，等待服务器扫描');
     const payload = await api('api/state');
     state.sources = payload.sources || [];
     state.stats = payload.stats || state.stats;

@@ -2163,6 +2163,10 @@ class ScannerService:
         self._scdn_proxy_page = 1
         self._source_locks_guard = threading.Lock()
         self._source_locks: dict[str, threading.Lock] = {}
+        self._submitted_source_scan_lock = threading.Lock()
+        self._submitted_source_scan_queue: queue.Queue[str] = queue.Queue()
+        self._submitted_source_scan_tokens: set[str] = set()
+        self._submitted_source_scan_worker: threading.Thread | None = None
         self._product_refresh_lock = threading.Lock()
         self._refreshing_products: set[str] = set()
         self._stop = threading.Event()
@@ -2326,6 +2330,79 @@ class ScannerService:
             "busy": not started and task["running"] and not joined,
             "task": task,
         }
+
+    def request_submitted_source_scan(self, token: str) -> bool:
+        """Queue a newly submitted public source for one server-side scan."""
+        source = self.database.get_source(token)
+        if source is None:
+            raise KeyError(token)
+        if not source.get("enabled") or source.get("source_kind") != "shop_api":
+            return False
+
+        start_worker = False
+        with self._submitted_source_scan_lock:
+            if token in self._submitted_source_scan_tokens:
+                return False
+            self._submitted_source_scan_tokens.add(token)
+            self._submitted_source_scan_queue.put(token)
+            if self._submitted_source_scan_worker is None or not self._submitted_source_scan_worker.is_alive():
+                self._submitted_source_scan_worker = threading.Thread(
+                    target=self._process_submitted_source_scans,
+                    name="submitted-source-scanner",
+                    daemon=True,
+                )
+                start_worker = True
+
+        if start_worker:
+            self._submitted_source_scan_worker.start()
+        self.events.publish("source_submission", {"phase": "queued", "token": token})
+        return True
+
+    def _process_submitted_source_scans(self) -> None:
+        while not self._stop.is_set():
+            try:
+                token = self._submitted_source_scan_queue.get_nowait()
+            except queue.Empty:
+                with self._submitted_source_scan_lock:
+                    if self._submitted_source_scan_queue.empty():
+                        self._submitted_source_scan_worker = None
+                        return
+                continue
+
+            try:
+                if not self._wait_for_local_ingest():
+                    return
+                source = self.database.get_source(token)
+                if source is None or not source.get("enabled"):
+                    continue
+                self.database.update_source_scan(token, status="scanning")
+                self.events.publish("source_submission", {"phase": "started", "token": token})
+                self._publish_status(
+                    "source_started",
+                    token=token,
+                    source_index=1,
+                    source_total=1,
+                    reason="user_submission",
+                )
+                try:
+                    matched, changed = self._scan_source(token)
+                except Exception as exc:
+                    message = str(exc) or exc.__class__.__name__
+                    self.database.update_source_scan(token, status="error", error=message, count=0, scanned=True)
+                    self._publish_status("source_error", token=token, error=message)
+                    self.events.publish(
+                        "source_submission", {"phase": "error", "token": token, "error": message}
+                    )
+                else:
+                    self.events.publish(
+                        "source_submission",
+                        {"phase": "completed", "token": token, "matched": matched, "changed": changed},
+                    )
+            finally:
+                self._submitted_source_scan_queue.task_done()
+                with self._submitted_source_scan_lock:
+                    self._submitted_source_scan_tokens.discard(token)
+                self._publish_snapshot()
 
     def _source_lock_for(self, token: str) -> threading.Lock:
         with self._source_locks_guard:
@@ -3689,7 +3766,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     remote_token=reference.remote_token,
                     entry_goods_key=reference.goods_key,
                 )
-                self._send_json({"ok": True, "source": source}, HTTPStatus.CREATED)
+                scan_queued = self.app.scanner.request_submitted_source_scan(token)
+                self._send_json(
+                    {"ok": True, "source": source, "scan_queued": scan_queued},
+                    HTTPStatus.CREATED,
+                )
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc))
             except LDXPError as exc:
