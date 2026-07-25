@@ -590,6 +590,7 @@ function forgetAdminKey(error) {
   state.adminVerified = false;
   sessionStorage.removeItem('ldxp-admin-key');
   elements.adminTokenInput.value = '';
+  renderSources();
 }
 
 async function verifyAdminToken(quiet = false) {
@@ -606,6 +607,7 @@ async function verifyAdminToken(quiet = false) {
     return false;
   } finally {
     updateAdminProxyScanButton();
+    renderSources();
   }
 }
 
@@ -869,10 +871,13 @@ function renderSources() {
       catch { return source.base_url || 'pay.ldxp.cn'; }
     })();
     const entryText = source.entry_goods_key ? ` · 入口商品 ${source.entry_goods_key}` : '';
+    const actions = state.adminVerified
+      ? `<div class="source-actions"><button type="button" data-action="toggle">${source.enabled ? '停用' : '启用'}</button><button type="button" class="danger" data-action="delete">删除</button></div>`
+      : '';
     return `<div class="source-item" data-token="${escapeHtml(source.token)}">
       <div class="source-name"><strong>${escapeHtml(source.name || source.token)}</strong><span>${escapeHtml(platform)} · ${escapeHtml(source.origin || '手动添加')} · ${source.product_count || 0} 件${escapeHtml(entryText)}${source.last_error ? ` · ${escapeHtml(source.last_error)}` : ''}</span></div>
       <span class="source-status ${escapeHtml(source.status)}">${escapeHtml(statusText)}</span>
-      <div class="source-actions"><button type="button" data-action="toggle">${source.enabled ? '停用' : '启用'}</button><button type="button" class="danger" data-action="delete">删除</button></div>
+      ${actions}
     </div>`;
   }).join('');
 }
@@ -1486,6 +1491,7 @@ elements.adminTokenVerifyButton.addEventListener('click', () => { void verifyAdm
 elements.adminTokenInput.addEventListener('input', () => {
   state.adminVerified = false;
   updateAdminProxyScanButton();
+  renderSources();
 });
 elements.adminFullScanButton.addEventListener('click', () => { void startServerFullScan(); });
 elements.adminProxyScanButton.addEventListener('click', () => { void startAdminProxyScan(); });
@@ -1520,15 +1526,25 @@ elements.sourceList.addEventListener('click', async (event) => {
   if (!button || !item) return;
   const token = item.dataset.token;
   const source = state.sources.find((value) => value.token === token);
+  if (!source || !state.adminVerified) return;
+  const headers = getAdminHeaders();
+  if (!headers) return;
   try {
     if (button.dataset.action === 'delete') {
       if (!confirm(`确认删除采集源 ${token}？对应的本地商品记录也会删除。`)) return;
-      await api(`api/sources/${encodeURIComponent(token)}`, { method: 'DELETE' });
+      await api(`api/sources/${encodeURIComponent(token)}`, { method: 'DELETE', headers });
     } else {
-      await api(`api/sources/${encodeURIComponent(token)}`, { method: 'PUT', body: JSON.stringify({ enabled: !source.enabled }) });
+      await api(`api/sources/${encodeURIComponent(token)}`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({ enabled: !source.enabled }),
+      });
     }
     await loadState();
-  } catch (error) { toast(error.message, true); }
+  } catch (error) {
+    forgetAdminKey(error);
+    toast(error.message, true);
+  }
 });
 
 const savedAdminToken = sessionStorage.getItem('ldxp-admin-key') || '';

@@ -3811,6 +3811,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path.startswith("/api/sources/"):
+            if not self._require_admin():
+                return
             token = urllib.parse.unquote(path.removeprefix("/api/sources/"))
             try:
                 token = normalize_source(token)
@@ -3828,6 +3830,8 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/api/sources/"):
+            if not self._require_admin():
+                return
             try:
                 token = normalize_source(urllib.parse.unquote(path.removeprefix("/api/sources/")))
             except ValueError as exc:

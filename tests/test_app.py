@@ -1,9 +1,13 @@
 import json
 import sqlite3
+import threading
 import unittest
 import urllib.error
+from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, call, patch
+
+import app
 
 from app import (
     CATFK_BASE_URL,
@@ -23,6 +27,8 @@ from app import (
     SCDNProxySource,
     ScanResult,
     ScannerService,
+    ScannerHTTPServer,
+    RequestHandler,
     classify_product,
     create_app,
     extract_ldxp_refs,
@@ -1019,6 +1025,76 @@ class DatabaseTests(unittest.TestCase):
             removed = service.sync_priceai_snapshot()
         self.assertEqual(removed["removed"], 1)
         self.assertIsNone(self.db.get_product("priceai:priceai-offer-1"))
+
+
+class SourcePermissionApiTests(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(__file__).resolve().parent / "_source_permission_api.db"
+        self._remove_database_files()
+        self.state = create_app(self.path, seed=False)
+        self.state.database.upsert_source("demo", "Demo source", origin="unit-test")
+        self.app_state_patch = patch.object(app, "APP_STATE", self.state)
+        self.admin_key_patch = patch.object(app, "LDXP_ADMIN_KEY", "test-admin-key")
+        self.app_state_patch.start()
+        self.admin_key_patch.start()
+        self.server = ScannerHTTPServer(("127.0.0.1", 0), RequestHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.admin_key_patch.stop()
+        self.app_state_patch.stop()
+        self.state.scanner.stop()
+        self._remove_database_files()
+
+    def _remove_database_files(self):
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.path}{suffix}")
+            if candidate.exists():
+                candidate.unlink()
+
+    def request(self, method, path, payload=None, *, admin=False):
+        body = json.dumps(payload).encode() if payload is not None else None
+        headers = {}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = str(len(body))
+        if admin:
+            headers["X-LDXP-Admin-Key"] = "test-admin-key"
+        connection = HTTPConnection(*self.server.server_address, timeout=2)
+        try:
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_source_toggle_and_delete_require_admin_key(self):
+        status, payload = self.request("PUT", "/api/sources/demo", {"enabled": False})
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(self.state.database.get_source("demo")["enabled"])
+
+        status, payload = self.request("DELETE", "/api/sources/demo")
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+        self.assertIsNotNone(self.state.database.get_source("demo"))
+
+    def test_admin_can_toggle_and_delete_source(self):
+        status, payload = self.request(
+            "PUT", "/api/sources/demo", {"enabled": False}, admin=True
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["enabled"])
+        self.assertFalse(self.state.database.get_source("demo")["enabled"])
+
+        status, payload = self.request("DELETE", "/api/sources/demo", admin=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["token"], "demo")
+        self.assertIsNone(self.state.database.get_source("demo"))
 
 
 class MigrationTests(unittest.TestCase):
