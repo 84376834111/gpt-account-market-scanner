@@ -1,13 +1,27 @@
 const state = {
   products: new Map(),
+  productTotal: 0,
+  nextProductOffset: 0,
+  hasMoreProducts: true,
+  productLoading: false,
+  productRequestId: 0,
+  productLoadLimit: 12,
+  catalogRevision: 0,
+  completedFilterKey: '',
+  streamedProducts: [],
+  streamRenderQueued: false,
   sources: [],
   categories: [],
   stats: {},
   selectedCategory: 'all',
   search: '',
   stockOnly: true,
+  minPrice: 0,
+  maxPrice: null,
+  includeMinPrice: false,
   sort: 'price',
   scanning: false,
+  scanTask: { running: false, reason: '', current_source: '', pending_sources: 0 },
   localScanning: false,
   localScanTarget: '',
   autoScanEnabled: false,
@@ -19,9 +33,21 @@ const state = {
   refreshTimers: new Map(),
   refreshingProducts: new Set(),
   renderQueued: false,
+  history: [],
+  historyMode: 'price',
+  adminVerified: false,
+  serverFullScanStarting: false,
+  proxyOnlyScanStarting: false,
+  proxyOnlyScanning: false,
+  priceaiSyncStarting: false,
+  priceaiSyncing: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
+let searchReloadTimer = 0;
+let nextLocalRequestAt = 0;
+const LOCAL_REQUEST_COOLDOWN_MS = 1000;
+const PRODUCT_CACHE_TTL_MS = 45_000;
 const elements = {
   grid: $('#productGrid'), empty: $('#emptyState'), tabs: $('#categoryTabs'),
   total: $('#totalStat'), stock: $('#stockStat'), low: $('#lowStat'), source: $('#sourceStat'),
@@ -29,10 +55,18 @@ const elements = {
   scanPulse: $('#scanPulse'), scanText: $('#scanStateText'),
   localScanButton: $('#localScanButton'), localScanLabel: $('#localScanButton .local-scan-label'),
   filteredLocalScanButton: $('#filteredLocalScanButton'), filteredScanLabel: $('#filteredLocalScanButton .filtered-scan-label'),
+  adminTokenInput: $('#adminTokenInput'), adminTokenVerifyButton: $('#adminTokenVerifyButton'),
+  adminFullScanButton: $('#adminFullScanButton'),
+  adminProxyScanButton: $('#adminProxyScanButton'),
+  priceaiSyncButton: $('#priceaiSyncButton'),
   scanDetail: $('#scanDetail'), stream: $('#streamStatus'), dialog: $('#sourceDialog'),
   sourceList: $('#sourceList'), sourceInput: $('#sourceInput'), toast: $('#toast'),
   historyDialog: $('#historyDialog'), historyTitle: $('#historyTitle'), historyShop: $('#historyShop'),
   historyToken: $('#historyToken'), historySummary: $('#historySummary'), historyChart: $('#historyChart'),
+  historyModes: $('#historyModes'),
+  priceMin: $('#priceMin'), priceMax: $('#priceMax'), includeMinPrice: $('#includeMinPrice'),
+  loadMore: $('#loadMoreProducts'), loadMoreButton: $('#loadMoreButton'),
+  loadBatchSize: $('#loadBatchSize'), loadMoreStatus: $('#loadMoreStatus'),
 };
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
@@ -74,18 +108,19 @@ async function api(path, options = {}) {
 async function loadState() {
   try {
     const payload = await api('api/state');
-    state.products = new Map((payload.products || []).map((product) => [product.goods_key, product]));
     state.sources = payload.sources || [];
     state.categories = payload.categories || [];
     state.stats = payload.stats || {};
+    state.catalogRevision = Number(payload.catalog_revision || 0);
     state.scanning = Boolean(payload.scanning);
+    state.scanTask = payload.scan_task || { running: state.scanning };
     state.autoScanEnabled = Boolean(payload.auto_scan_enabled);
     state.scanIntervalMinutes = Math.max(1, Math.round(Number(payload.scan_interval || 900) / 60));
     state.sourceInterval = Number(payload.source_interval || 15);
     updateStats();
     renderTabs();
-    renderProducts();
     renderSources();
+    await reloadProducts();
     setScanning(state.scanning, state.scanning ? '正在采集公开店铺' : '自动扫描已关闭');
   } catch (error) {
     toast(error.message, true);
@@ -94,21 +129,19 @@ async function loadState() {
 }
 
 function categoryCounts() {
-  const counts = Object.fromEntries(state.categories.map((category) => [category.key, 0]));
-  for (const product of state.products.values()) {
-    if (!product.active) continue;
-    for (const tag of product.tags || []) counts[tag] = (counts[tag] || 0) + 1;
-  }
-  return counts;
+  return state.stats.category_counts || {};
 }
 
 function renderTabs() {
   const counts = categoryCounts();
-  const tabs = [{ key: 'all', label: '全部', count: state.products.size }, ...state.categories.map((item) => ({ ...item, count: counts[item.key] || 0 }))];
+  const tabs = [{ key: 'all', label: '全部', count: Number(state.stats.total || 0) }, ...state.categories.map((item) => ({ ...item, count: counts[item.key] || 0 }))];
   elements.tabs.innerHTML = tabs.map((tab) => `
-    <button type="button" class="category ${state.selectedCategory === tab.key ? 'active' : ''} ${state.refreshingTags.has(tab.key) ? 'refreshing' : ''}" data-category="${escapeHtml(tab.key)}" role="tab" aria-selected="${state.selectedCategory === tab.key}" aria-busy="${state.refreshingTags.has(tab.key)}">
-      ${escapeHtml(tab.label)} <b>${tab.count}</b><i class="refresh-indicator" title="正在刷新" aria-hidden="true"></i>
-    </button>`).join('');
+    <span class="category-control">
+      <button type="button" class="category ${state.selectedCategory === tab.key ? 'active' : ''} ${state.refreshingTags.has(tab.key) ? 'refreshing' : ''}" data-category="${escapeHtml(tab.key)}" role="tab" aria-selected="${state.selectedCategory === tab.key}" aria-busy="${state.refreshingTags.has(tab.key)}">
+        ${escapeHtml(tab.label)} <b>${tab.count}</b><i class="refresh-indicator" title="正在刷新" aria-hidden="true"></i>
+      </button>
+      <button type="button" class="category-refresh" data-refresh-category="${escapeHtml(tab.key)}" title="用当前网络刷新 ${escapeHtml(tab.label)}" aria-label="用当前网络刷新 ${escapeHtml(tab.label)}" ${state.localScanning ? 'disabled' : ''}>↻</button>
+    </span>`).join('');
 }
 
 function stopTagRefreshing(key) {
@@ -145,7 +178,7 @@ function updateTabCounts() {
   const counts = categoryCounts();
   for (const tab of elements.tabs.querySelectorAll('[data-category]')) {
     const key = tab.dataset.category;
-    const count = key === 'all' ? [...state.products.values()].filter((product) => product.active).length : (counts[key] || 0);
+    const count = key === 'all' ? Number(state.stats.total || 0) : (counts[key] || 0);
     const badge = tab.querySelector('b');
     if (badge && badge.textContent !== String(count)) badge.textContent = String(count);
   }
@@ -155,6 +188,10 @@ function productMatchesFilters(product) {
   if (!product?.active) return false;
   if (state.selectedCategory !== 'all' && !(product.tags || []).includes(state.selectedCategory)) return false;
   if (state.stockOnly && !product.in_stock) return false;
+  const price = Number(product.price);
+  if (!Number.isFinite(price)) return false;
+  if (state.includeMinPrice ? price < state.minPrice : price <= state.minPrice) return false;
+  if (state.maxPrice !== null && price > state.maxPrice) return false;
   const query = state.search.trim().toLocaleLowerCase();
   return !query || `${product.name} ${product.source_name} ${product.category_name}`.toLocaleLowerCase().includes(query);
 }
@@ -171,6 +208,199 @@ function compareProducts(a, b) {
 
 function filteredProducts() {
   return [...state.products.values()].filter(productMatchesFilters).sort(compareProducts);
+}
+
+function currentProductQuery(limit, offset) {
+  return new URLSearchParams({
+    category: state.selectedCategory,
+    stock_only: state.stockOnly ? '1' : '0',
+    min_price: String(state.minPrice),
+    max_price: state.maxPrice === null ? '' : String(state.maxPrice),
+    include_min: state.includeMinPrice ? '1' : '0',
+    search: state.search.trim(),
+    sort: state.sort,
+    limit: String(limit),
+    offset: String(offset),
+  });
+}
+
+function currentFilterMappingKey() {
+  return JSON.stringify({
+    category: state.selectedCategory,
+    stock_only: state.stockOnly,
+    min_price: state.minPrice,
+    max_price: state.maxPrice,
+    include_min: state.includeMinPrice,
+    search: state.search.trim().toLocaleLowerCase(),
+  });
+}
+
+async function readProductStream(params, onRecord) {
+  const response = await fetch(`api/products/stream?${params.toString()}`, { cache: 'no-store' });
+  if (!response.ok) {
+    let payload = {};
+    try { payload = await response.json(); } catch { /* proxy errors may not be json */ }
+    throw new Error(payload.error || `请求失败 (${response.status})`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('当前浏览器不支持商品流式加载');
+  const decoder = new TextDecoder();
+  let buffered = '';
+  const consume = (final = false) => {
+    const lines = buffered.split('\n');
+    buffered = final ? '' : lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      onRecord(JSON.parse(line));
+    }
+    if (final && buffered.trim()) onRecord(JSON.parse(buffered));
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) {
+      buffered += decoder.decode(value, { stream: !done });
+      consume(false);
+    }
+    if (done) break;
+  }
+  buffered += decoder.decode();
+  consume(true);
+}
+
+function updateProductLoadingControls() {
+  const loaded = state.products.size;
+  const total = Number(state.productTotal || 0);
+  elements.result.textContent = total ? `已显示 ${loaded} / ${total} 件` : (state.productLoading ? '正在加载…' : '0 件');
+  elements.empty.hidden = state.productLoading || total > 0;
+  elements.loadMore.hidden = !state.productLoading && !state.hasMoreProducts;
+  elements.loadMoreButton.disabled = state.productLoading || !state.hasMoreProducts;
+  elements.loadMoreStatus.textContent = state.productLoading
+    ? '正在从服务器加载…'
+    : state.hasMoreProducts
+      ? `还有 ${Math.max(0, total - loaded)} 件可继续加载`
+      : `已显示全部 ${total} 件`;
+}
+
+function flushStreamedProducts() {
+  state.streamRenderQueued = false;
+  if (!state.streamedProducts.length) return;
+  const fragment = document.createDocumentFragment();
+  for (const product of state.streamedProducts.splice(0)) {
+    state.products.set(product.goods_key, product);
+    const card = findProductCard(product.goods_key);
+    if (card) {
+      updateProductCard(card, product);
+      positionProductCard(card, product);
+    } else if (productMatchesFilters(product)) {
+      fragment.appendChild(createProductCard(product));
+    }
+  }
+  elements.grid.appendChild(fragment);
+  updateProductLoadingControls();
+}
+
+function queueStreamedProduct(product) {
+  state.streamedProducts.push(product);
+  if (state.streamRenderQueued) return;
+  state.streamRenderQueued = true;
+  requestAnimationFrame(flushStreamedProducts);
+}
+
+function productCacheKey(params) {
+  return `ldxp-product-stream:${params.toString()}`;
+}
+
+function readCachedProductPage(params) {
+  try {
+    const cached = JSON.parse(localStorage.getItem(productCacheKey(params)) || 'null');
+    return cached
+      && Number(cached.expires_at) > Date.now()
+      && Number(cached.catalog_revision) === state.catalogRevision
+      && Array.isArray(cached.records)
+      ? cached.records
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function cacheProductPage(params, records) {
+  try {
+    localStorage.setItem(productCacheKey(params), JSON.stringify({
+      expires_at: Date.now() + PRODUCT_CACHE_TTL_MS,
+      catalog_revision: state.catalogRevision,
+      records,
+    }));
+  } catch {
+    // Storage can be unavailable in private mode; the live request still works.
+  }
+}
+
+function applyProductStreamRecord(record, requestId, offset) {
+  if (requestId !== state.productRequestId) return;
+  if (record.type === 'meta') {
+    state.productTotal = Number(record.total || 0);
+    state.catalogRevision = Number(record.catalog_revision || state.catalogRevision);
+    state.nextProductOffset = Number(record.next_offset || offset);
+    state.hasMoreProducts = Boolean(record.has_more);
+    if (!state.hasMoreProducts) state.completedFilterKey = currentFilterMappingKey();
+  } else if (record.type === 'product' && record.product) {
+    queueStreamedProduct(record.product);
+  }
+}
+
+async function loadProductBatch() {
+  if (state.productLoading || !state.hasMoreProducts) return;
+  const requestId = state.productRequestId;
+  const offset = state.nextProductOffset;
+  const query = currentProductQuery(state.productLoadLimit, offset);
+  state.productLoading = true;
+  updateProductLoadingControls();
+  try {
+    const cached = readCachedProductPage(query);
+    if (cached) {
+      cached.forEach((record) => applyProductStreamRecord(record, requestId, offset));
+    } else {
+      const records = [];
+      await readProductStream(query, (record) => {
+        if (record.type !== 'end') records.push(record);
+        applyProductStreamRecord(record, requestId, offset);
+      });
+      if (requestId === state.productRequestId) cacheProductPage(query, records);
+    }
+  } catch (error) {
+    if (requestId === state.productRequestId) toast(error.message, true);
+  } finally {
+    if (requestId === state.productRequestId) {
+      state.productLoading = false;
+      if (state.streamRenderQueued) flushStreamedProducts();
+      updateProductLoadingControls();
+    }
+  }
+}
+
+async function reloadProducts() {
+  state.productRequestId += 1;
+  state.products.clear();
+  state.productTotal = 0;
+  state.nextProductOffset = 0;
+  state.hasMoreProducts = true;
+  state.completedFilterKey = '';
+  state.productLoading = false;
+  state.streamedProducts = [];
+  elements.grid.replaceChildren();
+  updateProductLoadingControls();
+  await loadProductBatch();
+}
+
+function sortCompletedFilterMapping() {
+  const products = [...state.products.values()].sort(compareProducts);
+  const fragment = document.createDocumentFragment();
+  for (const product of products) fragment.appendChild(createProductCard(product));
+  elements.grid.replaceChildren(fragment);
+  updateVisibleSummary();
 }
 
 function productTags(product) {
@@ -249,6 +479,7 @@ function setProductRefreshing(goodsKey, refreshing) {
 }
 
 function applySingleProductRefresh(product) {
+  if (!state.products.has(product.goods_key)) return;
   state.products.set(product.goods_key, product);
   let card = findProductCard(product.goods_key);
   if (!productMatchesFilters(product)) {
@@ -259,16 +490,13 @@ function applySingleProductRefresh(product) {
     card = createProductCard(product);
     elements.grid.appendChild(card);
   }
-  updateStats();
-  updateTabCounts();
   updateVisibleSummary();
 }
 
 function applySingleProductRemoval(goodsKey) {
+  if (!state.products.has(goodsKey)) return;
   state.products.delete(goodsKey);
   findProductCard(goodsKey)?.remove();
-  updateStats();
-  updateTabCounts();
   updateVisibleSummary();
 }
 
@@ -307,37 +535,154 @@ function reconcileProductCard(product, change) {
 }
 
 function updateVisibleSummary() {
-  const count = elements.grid.childElementCount;
-  elements.result.textContent = `${count} 件`;
-  elements.empty.hidden = count > 0;
+  updateProductLoadingControls();
 }
 
 function renderProducts() {
-  const products = filteredProducts();
-  elements.result.textContent = `${products.length} 件`;
-  elements.grid.innerHTML = products.map(productCard).join('');
-  elements.empty.hidden = products.length > 0;
+  void reloadProducts();
 }
 
 function updateStats() {
-  const products = [...state.products.values()].filter((product) => product.active);
-  const inStock = products.filter((product) => product.in_stock).length;
-  const positivePrices = products.map((product) => Number(product.price)).filter((price) => price > 0);
-  elements.total.textContent = products.length.toLocaleString('zh-CN');
-  elements.stock.textContent = inStock.toLocaleString('zh-CN');
-  elements.low.textContent = positivePrices.length ? `¥${money(Math.min(...positivePrices))}` : '—';
+  const stats = state.stats || {};
+  elements.total.textContent = Number(stats.total || 0).toLocaleString('zh-CN');
+  elements.stock.textContent = Number(stats.in_stock || 0).toLocaleString('zh-CN');
+  elements.low.textContent = Number(stats.lowest_price || 0) > 0 ? `¥${money(stats.lowest_price)}` : '—';
   elements.source.textContent = state.sources.length.toLocaleString('zh-CN');
   elements.sourceSub.textContent = `${state.sources.filter((source) => source.enabled).length} 个已启用`;
-  const lastScan = Math.max(0, ...products.map((product) => Number(product.last_seen || 0)));
+  const lastScan = Number(stats.last_scan || 0);
   elements.lastUpdate.textContent = lastScan ? `最近更新 ${dateTime(lastScan)}` : '尚未更新';
+}
+
+function updateAdminProxyScanButton() {
+  const taskRunning = Boolean(state.scanTask?.running || state.scanning);
+  const scanBusy = state.localScanning || state.serverFullScanStarting || state.proxyOnlyScanStarting;
+  const allBusy = scanBusy || state.priceaiSyncStarting || state.priceaiSyncing;
+  elements.adminTokenVerifyButton.disabled = allBusy;
+  elements.adminFullScanButton.disabled = scanBusy || !state.adminVerified;
+  elements.adminFullScanButton.classList.toggle('scanning', taskRunning);
+  elements.adminFullScanButton.textContent = taskRunning ? '服务器扫描中' : '服务器全量扫描';
+  elements.adminProxyScanButton.disabled = scanBusy || !state.adminVerified;
+  elements.adminProxyScanButton.classList.toggle('scanning', taskRunning && state.scanTask?.reason === 'manual_proxy_only');
+  elements.adminProxyScanButton.textContent = taskRunning && state.scanTask?.reason === 'manual_proxy_only'
+    ? '代理扫描中'
+    : '代理全量扫描';
+  elements.priceaiSyncButton.disabled = state.priceaiSyncStarting || state.priceaiSyncing || !state.adminVerified;
+  elements.priceaiSyncButton.classList.toggle('scanning', state.priceaiSyncing);
+  elements.priceaiSyncButton.textContent = state.priceaiSyncing ? 'PriceAI 同步中' : '同步 PriceAI';
+  if (!state.localScanning) {
+    elements.localScanLabel.textContent = state.adminVerified ? '服务器全量扫描' : '本地全部扫描';
+    elements.filteredScanLabel.textContent = state.adminVerified ? '服务器刷新筛选' : '刷新当前筛选';
+  }
+}
+
+function getAdminHeaders() {
+  const key = String(elements.adminTokenInput.value || '').trim();
+  if (!key) {
+    toast('请先输入管理员令牌', true);
+    return null;
+  }
+  sessionStorage.setItem('ldxp-admin-key', key);
+  return { 'X-LDXP-Admin-Key': key };
+}
+
+function forgetAdminKey(error) {
+  if (error?.status !== 403) return;
+  state.adminVerified = false;
+  sessionStorage.removeItem('ldxp-admin-key');
+  elements.adminTokenInput.value = '';
+}
+
+async function verifyAdminToken(quiet = false) {
+  const headers = getAdminHeaders();
+  if (!headers) return false;
+  try {
+    await api('api/admin/verify', { method: 'POST', headers });
+    state.adminVerified = true;
+    if (!quiet) toast('管理员令牌已验证');
+    return true;
+  } catch (error) {
+    forgetAdminKey(error);
+    if (!quiet) toast(error.message, true);
+    return false;
+  } finally {
+    updateAdminProxyScanButton();
+  }
+}
+
+async function startServerFullScan() {
+  if (state.localScanning || state.serverFullScanStarting) return;
+  const headers = getAdminHeaders();
+  if (!headers) return;
+  state.serverFullScanStarting = true;
+  updateAdminProxyScanButton();
+  try {
+    const result = await api('api/scan', { method: 'POST', headers });
+    state.adminVerified = true;
+    state.scanTask = result.task || state.scanTask;
+    if (result.started || result.joined) {
+      setScanning(true, result.message || '服务器正在流式刷新商品');
+      await reloadProducts();
+    }
+    toast(result.message || '服务器全量扫描已启动');
+  } catch (error) {
+    forgetAdminKey(error);
+    toast(error.message, true);
+  } finally {
+    state.serverFullScanStarting = false;
+    updateAdminProxyScanButton();
+  }
+}
+
+async function startAdminProxyScan() {
+  if (state.localScanning || state.proxyOnlyScanStarting) return;
+  const headers = getAdminHeaders();
+  if (!headers) return;
+  state.proxyOnlyScanStarting = true;
+  updateAdminProxyScanButton();
+  try {
+    const result = await api('api/scan/proxy-only', { method: 'POST', headers });
+    state.adminVerified = true;
+    state.scanTask = result.task || state.scanTask;
+    if (result.started || result.joined) {
+      setScanning(true, result.message || '服务器正在流式刷新商品');
+      await reloadProducts();
+    }
+    toast(result.message || '服务器代理扫描已启动');
+  } catch (error) {
+    forgetAdminKey(error);
+    toast(error.message, true);
+  } finally {
+    state.proxyOnlyScanStarting = false;
+    updateAdminProxyScanButton();
+  }
+}
+
+async function startPriceaiSync() {
+  if (state.priceaiSyncStarting || state.priceaiSyncing) return;
+  const headers = getAdminHeaders();
+  if (!headers) return;
+  state.priceaiSyncStarting = true;
+  updateAdminProxyScanButton();
+  try {
+    const result = await api('api/import/priceai', { method: 'POST', headers });
+    state.adminVerified = true;
+    toast(result.message || 'PriceAI 公开快照同步已启动');
+  } catch (error) {
+    forgetAdminKey(error);
+    toast(error.message, true);
+  } finally {
+    state.priceaiSyncStarting = false;
+    updateAdminProxyScanButton();
+  }
 }
 
 function setScanning(scanning, detail = '') {
   state.scanning = scanning;
   const busy = scanning || state.localScanning;
-  elements.localScanButton.disabled = busy;
-  elements.filteredLocalScanButton.disabled = busy;
+  elements.localScanButton.disabled = state.localScanning;
+  elements.filteredLocalScanButton.disabled = state.localScanning;
   elements.scanPulse.classList.toggle('active', busy);
+  updateAdminProxyScanButton();
   if (!state.localScanning) {
     elements.scanText.textContent = scanning ? '扫描进行中' : '实时监听中';
     elements.scanDetail.textContent = detail || (scanning ? '商品正在逐条刷新' : (state.autoScanEnabled ? '自动扫描已开启' : '自动扫描已关闭'));
@@ -348,19 +693,23 @@ function setLocalScanning(scanning, detail = '', label = '', target = state.loca
   state.localScanning = scanning;
   state.localScanTarget = scanning ? target : '';
   const busy = scanning || state.scanning;
-  elements.localScanButton.disabled = busy;
-  elements.filteredLocalScanButton.disabled = busy;
+  elements.localScanButton.disabled = scanning;
+  elements.filteredLocalScanButton.disabled = scanning;
   elements.localScanButton.classList.toggle('scanning', scanning && target === 'all');
   elements.filteredLocalScanButton.classList.toggle('scanning', scanning && target === 'filter');
+  for (const button of elements.tabs.querySelectorAll('[data-refresh-category]')) button.disabled = scanning;
   elements.scanPulse.classList.toggle('active', busy);
+  updateAdminProxyScanButton();
   elements.localScanLabel.textContent = scanning && target === 'all' ? (label || '本地扫描中') : '本地全部扫描';
   elements.filteredScanLabel.textContent = scanning && target === 'filter' ? (label || '筛选页刷新中') : '刷新当前筛选';
   if (scanning) {
     elements.scanText.textContent = '本地扫描进行中';
     elements.scanDetail.textContent = detail || '正在使用当前设备的网络采集';
-  } else if (!state.scanning) {
-    elements.scanText.textContent = '实时监听中';
-    elements.scanDetail.textContent = detail || (state.autoScanEnabled ? '自动扫描已开启' : '自动扫描已关闭');
+  } else {
+    elements.scanText.textContent = state.scanning ? '服务器扫描进行中' : '实时监听中';
+    elements.scanDetail.textContent = detail || (state.scanning
+      ? '服务器后台扫描继续运行'
+      : (state.autoScanEnabled ? '自动扫描已开启' : '自动扫描已关闭'));
   }
 }
 
@@ -368,33 +717,46 @@ function scheduleIncrementalRender() {
   if (state.renderQueued) return;
   state.renderQueued = true;
   requestAnimationFrame(() => {
-    let countsDirty = state.pendingRemovals.size > 0;
     for (const key of state.pendingRemovals) {
+      if (!state.products.has(key)) continue;
       state.products.delete(key);
       findProductCard(key)?.remove();
+      if (state.completedFilterKey === currentFilterMappingKey()) state.productTotal = Math.max(0, state.productTotal - 1);
     }
     state.pendingRemovals.clear();
     for (const [key, update] of state.pendingProducts) {
-      const isNew = !state.products.has(key);
+      const existed = state.products.has(key);
+      const canAddToCompletedMapping = state.completedFilterKey === currentFilterMappingKey()
+        && productMatchesFilters(update.product);
+      if (!existed && !canAddToCompletedMapping) continue;
+      if (!productMatchesFilters(update.product)) {
+        state.products.delete(key);
+        findProductCard(key)?.remove();
+        if (existed && state.completedFilterKey === currentFilterMappingKey()) state.productTotal = Math.max(0, state.productTotal - 1);
+        continue;
+      }
       state.products.set(key, update.product);
       reconcileProductCard(update.product, update.change);
-      if (isNew || update.change !== 'unchanged') countsDirty = true;
+      if (!existed && state.completedFilterKey === currentFilterMappingKey()) state.productTotal += 1;
     }
     state.pendingProducts.clear();
     state.renderQueued = false;
-    updateStats();
-    if (countsDirty) updateTabCounts();
     updateVisibleSummary();
   });
 }
 
 function queueProduct(product, change = 'changed') {
+  const canAddToCompletedMapping = state.completedFilterKey === currentFilterMappingKey()
+    && productMatchesFilters(product);
+  const streamCurrentServerScan = Boolean(state.scanTask?.running) && productMatchesFilters(product);
+  if (!state.products.has(product.goods_key) && !canAddToCompletedMapping && !streamCurrentServerScan) return;
   state.pendingRemovals.delete(product.goods_key);
   state.pendingProducts.set(product.goods_key, { product, change });
   scheduleIncrementalRender();
 }
 
 function queueProductRemoval(goodsKey) {
+  if (!state.products.has(goodsKey)) return;
   state.pendingProducts.delete(goodsKey);
   state.pendingRemovals.add(goodsKey);
   scheduleIncrementalRender();
@@ -409,6 +771,12 @@ function connectEvents() {
   stream.addEventListener('error', () => {
     elements.stream.className = 'stream-status error';
     elements.stream.querySelector('span').textContent = '连接重试中';
+  });
+  stream.addEventListener('ready', (event) => {
+    const payload = JSON.parse(event.data);
+    state.scanning = Boolean(payload.scanning);
+    state.scanTask = payload.task || state.scanTask;
+    updateAdminProxyScanButton();
   });
   stream.addEventListener('product', (event) => {
     const payload = JSON.parse(event.data);
@@ -430,16 +798,25 @@ function connectEvents() {
   });
   stream.addEventListener('scan_status', (event) => {
     const payload = JSON.parse(event.data);
+    state.scanTask = payload.task || state.scanTask;
+    if (payload.phase === 'started' && payload.reason === 'manual_proxy_only') state.proxyOnlyScanning = true;
+    if (payload.phase === 'completed') state.proxyOnlyScanning = false;
     if (payload.phase === 'started') clearRefreshingTags();
     if (payload.phase === 'completed') setTimeout(clearRefreshingTags, 300);
     setScanning(Boolean(payload.scanning), scanMessage(payload));
   });
   stream.addEventListener('snapshot', (event) => {
     const payload = JSON.parse(event.data);
+    const nextRevision = Number(payload.catalog_revision || state.catalogRevision);
+    const mappingChanged = nextRevision !== state.catalogRevision;
     state.sources = payload.sources || state.sources;
     state.stats = payload.stats || state.stats;
+    state.catalogRevision = nextRevision;
+    state.scanTask = payload.scan_task || state.scanTask;
     renderSources();
     updateStats();
+    renderTabs();
+    if (mappingChanged) void reloadProducts();
   });
   stream.addEventListener('discovery_status', (event) => {
     const payload = JSON.parse(event.data);
@@ -457,9 +834,21 @@ function connectEvents() {
     state.scanIntervalMinutes = Math.max(1, Math.round(Number(payload.interval || 900) / 60));
     state.sourceInterval = Number(payload.source_interval || 15);
   });
+  stream.addEventListener('priceai_sync', (event) => {
+    const payload = JSON.parse(event.data);
+    state.priceaiSyncing = payload.phase === 'started';
+    if (payload.phase === 'completed') {
+      toast(`PriceAI 同步完成：${Number(payload.matched || 0)} 件，更新 ${Number(payload.changed || 0)} 件`);
+      void loadState();
+    } else if (payload.phase === 'error') {
+      toast(`PriceAI 同步失败：${payload.error}`, true);
+    }
+    updateAdminProxyScanButton();
+  });
 }
 
 function scanMessage(payload) {
+  if (payload.phase === 'waiting_for_user') return '正在等待用户刷新写入完成';
   if (payload.phase === 'source_started') return `正在扫描 ${payload.token}（${payload.source_index}/${payload.source_total}）`;
   if (payload.phase === 'source_completed') return `${payload.name || payload.token}：匹配 ${payload.matched} 件`;
   if (payload.phase === 'source_error') return `${payload.token}：${payload.error}`;
@@ -468,7 +857,7 @@ function scanMessage(payload) {
 }
 
 function renderSources() {
-  if (!elements.sourceList) return;
+  if (!elements.sourceList || !elements.dialog.open) return;
   if (!state.sources.length) {
     elements.sourceList.innerHTML = '<div class="empty"><strong>还没有采集源</strong></div>';
     return;
@@ -488,39 +877,63 @@ function renderSources() {
   }).join('');
 }
 
-function priceHistorySvg(history) {
-  const points = [...history]
-    .filter((point) => Number.isFinite(Number(point.price)))
-    .sort((a, b) => Number(a.recorded_at) - Number(b.recorded_at));
-  if (!points.length) return '<div class="history-empty">暂无价格节点，等待下一次成功刷新。</div>';
+function historySeries(history, mode) {
+  const points = [...history].sort((a, b) => Number(a.recorded_at) - Number(b.recorded_at));
+  if (mode === 'price') {
+    return points
+      .filter((point) => Number.isFinite(Number(point.price)) && Number(point.price) >= 0)
+      .map((point) => ({ ...point, value: Number(point.price) }));
+  }
+  return points
+    .filter((point) => Number.isFinite(Number(point.stock_count)) && Number(point.stock_count) >= 0)
+    .map((point) => ({ ...point, value: Number(point.stock_count) }));
+}
+
+function historySvg(history, mode) {
+  const points = historySeries(history, mode);
+  const labels = { price: '价格', stock: '库存余量' };
+  if (!points.length) return `<div class="history-empty">暂无可用${labels[mode]}节点，等待下一次成功刷新。</div>`;
 
   const width = 760, height = 280;
   const margin = { left: 58, right: 20, top: 20, bottom: 40 };
   const chartWidth = width - margin.left - margin.right;
   const chartHeight = height - margin.top - margin.bottom;
-  const prices = points.map((point) => Number(point.price));
-  let minimum = Math.min(...prices), maximum = Math.max(...prices);
+  const values = points.map((point) => Number(point.value));
+  let minimum = Math.min(...values), maximum = Math.max(...values);
   const padding = Math.max((maximum - minimum) * .12, maximum * .03, .5);
   minimum = Math.max(0, minimum - padding);
   maximum += padding;
   const range = Math.max(.01, maximum - minimum);
   const x = (index) => points.length === 1 ? margin.left + chartWidth / 2 : margin.left + index * chartWidth / (points.length - 1);
-  const y = (price) => margin.top + (maximum - price) * chartHeight / range;
-  const path = points.map((point, index) => `${index ? 'L' : 'M'} ${x(index).toFixed(2)} ${y(Number(point.price)).toFixed(2)}`).join(' ');
+  const y = (value) => margin.top + (maximum - value) * chartHeight / range;
+  const path = points.map((point, index) => `${index ? 'L' : 'M'} ${x(index).toFixed(2)} ${y(Number(point.value)).toFixed(2)}`).join(' ');
   const area = `${path} L ${x(points.length - 1).toFixed(2)} ${margin.top + chartHeight} L ${x(0).toFixed(2)} ${margin.top + chartHeight} Z`;
   const grids = Array.from({ length: 5 }, (_, index) => {
     const value = maximum - index * range / 4;
     const lineY = margin.top + index * chartHeight / 4;
-    return `<line x1="${margin.left}" y1="${lineY}" x2="${width - margin.right}" y2="${lineY}"/><text x="${margin.left - 9}" y="${lineY + 4}" text-anchor="end">¥${money(value)}</text>`;
+    return `<line x1="${margin.left}" y1="${lineY}" x2="${width - margin.right}" y2="${lineY}"/><text x="${margin.left - 9}" y="${lineY + 4}" text-anchor="end">${Math.round(value)}</text>`;
   }).join('');
-  const circles = points.map((point, index) => `<circle cx="${x(index)}" cy="${y(Number(point.price))}" r="3"><title>${escapeHtml(dateTime(point.recorded_at))} · ¥${money(point.price)} · 库存 ${escapeHtml(point.stock_count)}</title></circle>`).join('');
+  const circles = points.map((point, index) => {
+    const value = mode === 'price' ? `¥${money(point.value)}` : Math.round(point.value);
+    const detail = mode === 'price' ? `库存 ${escapeHtml(point.stock_count)}` : `价格 ¥${money(point.price)}`;
+    return `<circle cx="${x(index)}" cy="${y(Number(point.value))}" r="3"><title>${escapeHtml(dateTime(point.recorded_at))} · ${escapeHtml(labels[mode])} ${value} · ${detail}</title></circle>`;
+  }).join('');
   const firstTime = dateTime(points[0].recorded_at);
   const lastTime = dateTime(points[points.length - 1].recorded_at);
-  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="价格随刷新时间变化的折线图">
-    <g class="chart-grid">${grids}</g><path class="chart-area" d="${area}"/><path class="chart-line" d="${path}"/><g class="chart-points">${circles}</g>
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(labels[mode])}随刷新时间变化的折线图">
+    <g class="chart-grid">${grids}</g><path class="chart-area ${mode === 'price' ? 'chart-price-area' : ''}" d="${area}"/><path class="chart-line ${mode === 'price' ? 'chart-price-line' : ''}" d="${path}"/><g class="chart-points ${mode === 'price' ? 'chart-price-points' : ''}">${circles}</g>
     <text class="chart-time" x="${margin.left}" y="${height - 12}">${escapeHtml(firstTime)}</text>
     <text class="chart-time" x="${width - margin.right}" y="${height - 12}" text-anchor="end">${escapeHtml(lastTime)}</text>
   </svg>`;
+}
+
+function renderHistoryChart() {
+  for (const button of elements.historyModes.querySelectorAll('[data-history-mode]')) {
+    const active = button.dataset.historyMode === state.historyMode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  }
+  elements.historyChart.innerHTML = historySvg(state.history, state.historyMode);
 }
 
 async function openPriceHistory(goodsKey) {
@@ -530,11 +943,13 @@ async function openPriceHistory(goodsKey) {
   elements.historyShop.textContent = product.source_name || product.source_token;
   elements.historyToken.textContent = product.source_token;
   elements.historySummary.innerHTML = '';
-  elements.historyChart.innerHTML = '<p>正在加载价格节点…</p>';
+  elements.historyChart.innerHTML = '<p>正在加载刷新节点…</p>';
   if (!elements.historyDialog.open) elements.historyDialog.showModal();
   try {
     const payload = await api(`api/history/${encodeURIComponent(goodsKey)}`);
     const history = payload.history || [];
+    state.history = history;
+    state.historyMode = 'price';
     const prices = history.map((point) => Number(point.price)).filter(Number.isFinite);
     const latest = history[0] || { price: product.price, recorded_at: product.last_seen };
     const lowest = prices.length ? Math.min(...prices) : Number(product.price);
@@ -544,16 +959,82 @@ async function openPriceHistory(goodsKey) {
       <article><span>最低价</span><strong>¥${money(lowest)}</strong></article>
       <article><span>最高价</span><strong>¥${money(highest)}</strong></article>
       <article><span>刷新节点</span><strong>${history.length}</strong></article>`;
-    elements.historyChart.innerHTML = priceHistorySvg(history);
+    renderHistoryChart();
   } catch (error) {
     elements.historyChart.innerHTML = `<div class="history-empty">${escapeHtml(error.message)}</div>`;
   }
 }
 
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function joinServerProductRefresh(goodsKey) {
+  setProductRefreshing(goodsKey, true);
+  toast('服务器正在刷新同店数据，正在接收对应商品更新');
+  try {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      const payload = await api(`api/products/${encodeURIComponent(goodsKey)}/refresh-status`);
+      if (payload.product) applySingleProductRefresh(payload.product);
+      if (!payload.refreshing) return;
+      await delay(1500);
+    }
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setProductRefreshing(goodsKey, false);
+  }
+}
+
+async function refreshProductOnServer(goodsKey) {
+  const headers = getAdminHeaders();
+  if (!headers) return false;
+  setProductRefreshing(goodsKey, true);
+  try {
+    const result = await api(`api/products/${encodeURIComponent(goodsKey)}/refresh`, {
+      method: 'POST',
+      headers,
+    });
+    state.adminVerified = true;
+    if (result.joined) {
+      await joinServerProductRefresh(goodsKey);
+      return true;
+    }
+    if (result.product) applySingleProductRefresh(result.product);
+    if (result.removed) applySingleProductRemoval(goodsKey);
+    toast(result.message || '服务器已刷新该商品');
+    return true;
+  } catch (error) {
+    forgetAdminKey(error);
+    toast(error.message, true);
+    return false;
+  } finally {
+    setProductRefreshing(goodsKey, false);
+    updateAdminProxyScanButton();
+  }
+}
+
 async function refreshProduct(goodsKey) {
-  if (!goodsKey || state.refreshingProducts.has(goodsKey) || state.scanning || state.localScanning) return;
+  if (!goodsKey || state.refreshingProducts.has(goodsKey) || state.localScanning) return;
   const product = state.products.get(goodsKey);
   if (!product) return;
+  const source = state.sources.find((item) => item.token === product.source_token);
+  if (source?.source_kind !== 'shop_api') {
+    toast('该商品由 PriceAI 快照维护，请使用同步 PriceAI 更新', true);
+    return;
+  }
+  if (state.adminVerified) {
+    await refreshProductOnServer(goodsKey);
+    return;
+  }
+  try {
+    const status = await api(`api/products/${encodeURIComponent(goodsKey)}/refresh-status`);
+    if (status.refreshing) {
+      await joinServerProductRefresh(goodsKey);
+      return;
+    }
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
   setProductRefreshing(goodsKey, true);
   setLocalScanning(true, `正在用当前设备刷新 ${product.name}`, '刷新单件 1/1', 'filter');
   try {
@@ -632,6 +1113,9 @@ function compactLocalItem(item, goodsType) {
 }
 
 async function collectLocalSource(source) {
+  if (source?.source_kind !== 'shop_api') {
+    throw new Error('该来源不是可本地扫描的店铺 API');
+  }
   const baseUrl = sourceBaseUrl(source);
   const remoteToken = sourceRemoteToken(source);
   const shop = await localMarketplacePost(baseUrl, '/shopApi/Shop/info', { token: remoteToken });
@@ -812,16 +1296,27 @@ async function refreshLocalProducts(products, onProgress = null) {
   return { completed, failed, matched, requested };
 }
 
-async function localFilteredScan() {
-  if (state.scanning || state.localScanning) return;
-  const products = filteredProducts();
-  if (!products.length) {
-    toast('当前筛选没有可刷新的商品', true);
+async function localFilteredScan(scopeLabel = '当前筛选') {
+  if (state.localScanning) return;
+  if (state.adminVerified) {
+    await startServerFullScan();
     return;
   }
-
-  setLocalScanning(true, `准备刷新当前筛选的 ${products.length} 件商品`, '筛选刷新 0%', 'filter');
+  setLocalScanning(true, `正在读取${scopeLabel}结果`, '筛选读取中', 'filter');
   try {
+    const products = await loadAllFilteredProducts((loaded, total) => {
+      setLocalScanning(
+        true,
+        `正在读取${scopeLabel}结果（${loaded}/${total || '…'}）`,
+        '筛选读取中',
+        'filter',
+      );
+    });
+    if (!products.length) {
+      toast(`${scopeLabel}没有可刷新的商品`, true);
+      return;
+    }
+    setLocalScanning(true, `准备刷新${scopeLabel}的 ${products.length} 件商品`, '筛选刷新 0%', 'filter');
     const result = await refreshLocalProducts(products, (source, current, total) => {
       setLocalScanning(
         true,
@@ -830,16 +1325,45 @@ async function localFilteredScan() {
         'filter',
       );
     });
-    toast(`当前筛选刷新完成：提交 ${result.requested} 件，匹配 ${result.matched} 件，失败 ${result.failed} 组`, result.failed > 0);
+    toast(`${scopeLabel}刷新完成：提交 ${result.requested} 件，匹配 ${result.matched} 件，失败 ${result.failed} 组`, result.failed > 0);
+  } catch (error) {
+    toast(error.message, true);
   } finally {
     setLocalScanning(false, state.autoScanEnabled ? '服务器自动扫描已在后台开启' : '服务器自动扫描已在后台暂停', '', 'filter');
     await loadState();
   }
 }
 
+async function loadAllFilteredProducts(onProgress) {
+  const products = [];
+  let offset = 0;
+  let total = 0;
+  while (true) {
+    let nextOffset = offset;
+    await readProductStream(currentProductQuery(500, offset), (record) => {
+      if (record.type === 'meta') {
+        total = Number(record.total || 0);
+        nextOffset = Number(record.next_offset || offset);
+      } else if (record.type === 'product' && record.product) {
+        products.push(record.product);
+        onProgress?.(products.length, total);
+      }
+    });
+    if (!total || nextOffset >= total || nextOffset <= offset) break;
+    offset = nextOffset;
+  }
+  return products;
+}
+
 async function localManualScan() {
-  if (state.scanning || state.localScanning) return;
-  const sources = state.sources.filter((source) => source.enabled);
+  if (state.localScanning) return;
+  if (state.adminVerified) {
+    await startServerFullScan();
+    return;
+  }
+  const sources = state.sources.filter(
+    (source) => source.enabled && source.source_kind === 'shop_api'
+  );
   if (!sources.length) {
     toast('没有已启用的采集源', true);
     return;
@@ -879,8 +1403,26 @@ async function localManualScan() {
 }
 
 function openSources() {
-  renderSources();
   if (!elements.dialog.open) elements.dialog.showModal();
+  renderSources();
+}
+
+function applyPriceRange() {
+  const minimum = Number(elements.priceMin.value || 0);
+  const maximumText = elements.priceMax.value.trim();
+  const maximum = maximumText === '' ? null : Number(maximumText);
+  if (!Number.isFinite(minimum) || minimum < 0 || (maximum !== null && (!Number.isFinite(maximum) || maximum < 0))) {
+    toast('价格范围必须是非负数字', true);
+    return;
+  }
+  if (maximum !== null && maximum < minimum) {
+    toast('最高价格不能低于最低价格', true);
+    return;
+  }
+  state.minPrice = minimum;
+  state.maxPrice = maximum;
+  state.includeMinPrice = elements.includeMinPrice.checked;
+  renderProducts();
 }
 
 document.addEventListener('click', (event) => {
@@ -899,17 +1441,61 @@ document.addEventListener('click', (event) => {
     return;
   }
   const tab = event.target.closest('[data-category]');
+  const refreshCategory = event.target.closest('[data-refresh-category]');
+  if (refreshCategory) {
+    const category = refreshCategory.dataset.refreshCategory;
+    const label = category === 'all'
+      ? '全部商品'
+      : state.categories.find((item) => item.key === category)?.label || category;
+    state.selectedCategory = category;
+    renderTabs();
+    renderProducts();
+    void localFilteredScan(label);
+    return;
+  }
   if (tab) {
     state.selectedCategory = tab.dataset.category;
     renderTabs(); renderProducts();
   }
 });
 
-$('#searchInput').addEventListener('input', (event) => { state.search = event.target.value; renderProducts(); });
+$('#searchInput').addEventListener('input', (event) => {
+  state.search = event.target.value;
+  clearTimeout(searchReloadTimer);
+  searchReloadTimer = setTimeout(() => renderProducts(), 220);
+});
 $('#stockOnly').addEventListener('change', (event) => { state.stockOnly = event.target.checked; renderProducts(); });
-$('#sortSelect').addEventListener('change', (event) => { state.sort = event.target.value; renderProducts(); });
+elements.priceMin.addEventListener('change', applyPriceRange);
+elements.priceMax.addEventListener('change', applyPriceRange);
+elements.includeMinPrice.addEventListener('change', applyPriceRange);
+$('#sortSelect').addEventListener('change', (event) => {
+  state.sort = event.target.value;
+  if (state.completedFilterKey === currentFilterMappingKey()) {
+    sortCompletedFilterMapping();
+  } else {
+    renderProducts();
+  }
+});
+elements.loadBatchSize.addEventListener('change', (event) => {
+  state.productLoadLimit = Number(event.target.value) || 12;
+});
+elements.loadMoreButton.addEventListener('click', () => { void loadProductBatch(); });
 elements.localScanButton.addEventListener('click', localManualScan);
-elements.filteredLocalScanButton.addEventListener('click', localFilteredScan);
+elements.filteredLocalScanButton.addEventListener('click', () => { void localFilteredScan(); });
+elements.adminTokenVerifyButton.addEventListener('click', () => { void verifyAdminToken(); });
+elements.adminTokenInput.addEventListener('input', () => {
+  state.adminVerified = false;
+  updateAdminProxyScanButton();
+});
+elements.adminFullScanButton.addEventListener('click', () => { void startServerFullScan(); });
+elements.adminProxyScanButton.addEventListener('click', () => { void startAdminProxyScan(); });
+elements.priceaiSyncButton.addEventListener('click', () => { void startPriceaiSync(); });
+elements.historyModes.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-history-mode]');
+  if (!button) return;
+  state.historyMode = button.dataset.historyMode;
+  renderHistoryChart();
+});
 $('#sourceButton').addEventListener('click', () => openSources());
 
 $('#addSourceForm').addEventListener('submit', async (event) => {
@@ -923,6 +1509,7 @@ $('#addSourceForm').addEventListener('submit', async (event) => {
     toast('采集源已加入，可使用本地扫描刷新');
     const payload = await api('api/state');
     state.sources = payload.sources || [];
+    state.stats = payload.stats || state.stats;
     renderSources(); updateStats();
   } catch (error) { toast(error.message, true); }
 });
@@ -940,13 +1527,16 @@ elements.sourceList.addEventListener('click', async (event) => {
     } else {
       await api(`api/sources/${encodeURIComponent(token)}`, { method: 'PUT', body: JSON.stringify({ enabled: !source.enabled }) });
     }
-    const payload = await api('api/state');
-    state.sources = payload.sources || [];
-    state.products = new Map((payload.products || []).map((product) => [product.goods_key, product]));
-    renderSources(); updateStats(); renderTabs(); renderProducts();
+    await loadState();
   } catch (error) { toast(error.message, true); }
 });
 
+const savedAdminToken = sessionStorage.getItem('ldxp-admin-key') || '';
+if (savedAdminToken) {
+  elements.adminTokenInput.value = savedAdminToken;
+  void verifyAdminToken(true);
+}
+updateAdminProxyScanButton();
 loadState();
 connectEvents();
 setInterval(() => {

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#101a2f">
   <title>LDXP 扫货台</title>
-  <link rel="stylesheet" href="style.css?v=20260724-local-filter">
+  <link rel="stylesheet" href="style.css?v=20260725-side-actions">
 </head>
 <body>
   <div class="shell">
@@ -28,11 +28,19 @@
           </div>
           <div class="category-actions">
             <span id="streamStatus" class="stream-status offline"><i></i><span>正在连接</span></span>
+            <div class="admin-controls">
+              <label class="admin-token"><span>管理员令牌</span><input id="adminTokenInput" type="password" autocomplete="off" placeholder="输入 Token"></label>
+              <button id="adminTokenVerifyButton" class="button ghost admin-scan-button" type="button">验证</button>
+              <button id="adminFullScanButton" class="button ghost admin-scan-button" type="button">服务器全量扫描</button>
+              <button id="adminProxyScanButton" class="button ghost admin-scan-button" type="button" title="仅通过代理池扫描">代理全量扫描</button>
+              <button id="priceaiSyncButton" class="button ghost admin-scan-button" type="button">同步 PriceAI</button>
+            </div>
             <button id="sourceButton" class="button ghost" type="button">采集源</button>
             <div class="scan-actions">
               <button id="localScanButton" class="button primary local-scan-button" type="button"><span class="scan-icon">↯</span><span class="local-scan-label">本地全部扫描</span></button>
               <button id="filteredLocalScanButton" class="button ghost local-scan-button" type="button"><span class="scan-icon">↻</span><span class="filtered-scan-label">刷新当前筛选</span></button>
             </div>
+            <span class="full-scan-notice">全店扫描会产生大量本地请求，优先刷新当前筛选</span>
             <span id="scanPulse" class="visually-hidden"></span>
             <span id="scanStateText" class="visually-hidden" aria-live="polite">等待首轮扫描</span>
             <span id="scanDetail" class="visually-hidden">正在读取服务器后台状态</span>
@@ -42,9 +50,15 @@
         <div class="toolbar">
           <label class="search">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 21-4.35-4.35m2.35-5.15a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z"/></svg>
-            <input id="searchInput" type="search" placeholder="搜索商品或店铺" autocomplete="off">
+            <input id="searchInput" type="search" placeholder="搜索商品、店铺或商品链接" autocomplete="off">
           </label>
           <label class="stock-toggle"><input id="stockOnly" type="checkbox" checked><span></span>只看有货</label>
+          <div class="price-range" role="group" aria-label="价格范围">
+            <label class="zero-price-toggle"><input id="includeMinPrice" type="checkbox">包含左范围</label>
+            <label class="price-bound"><span>价格</span><input id="priceMin" type="number" min="0" step="0.01" value="0" inputmode="decimal" aria-label="最低价格"></label>
+            <span class="price-separator">至</span>
+            <label class="price-bound"><input id="priceMax" type="number" min="0" step="0.01" inputmode="decimal" placeholder="不限" aria-label="最高价格"></label>
+          </div>
           <label class="select-label">排序
             <select id="sortSelect">
               <option value="updated">最近变化</option>
@@ -59,6 +73,19 @@
         <div id="emptyState" class="empty" hidden>
           <span>⌁</span><strong>暂时没有匹配商品</strong><p>点击“本地全部扫描”，或在“采集源”中加入新的公开店铺。</p>
         </div>
+        <div id="loadMoreProducts" class="load-more-products" hidden>
+          <span id="loadMoreStatus" aria-live="polite"></span>
+          <label>每次加载
+            <select id="loadBatchSize" aria-label="每次加载的商品数量">
+              <option value="12" selected>12</option>
+              <option value="24">24</option>
+              <option value="48">48</option>
+              <option value="96">96</option>
+            </select>
+            件
+          </label>
+          <button id="loadMoreButton" class="button ghost" type="button">继续加载</button>
+        </div>
       </section>
     </main>
 
@@ -70,8 +97,12 @@
     <div class="history-body">
       <div class="history-shop"><div><span>来源店铺</span><strong id="historyShop">—</strong></div><code id="historyToken">—</code></div>
       <div id="historySummary" class="history-summary"></div>
+      <div id="historyModes" class="history-modes" role="tablist" aria-label="商品走势视图">
+        <button type="button" data-history-mode="price" class="active" role="tab" aria-selected="true">价格</button>
+        <button type="button" data-history-mode="stock" role="tab" aria-selected="false">余量</button>
+      </div>
       <div id="historyChart" class="history-chart" aria-live="polite"><p>正在加载价格节点…</p></div>
-      <p class="history-note">每个节点对应一次成功刷新，展示最近 100 个时间点。</p>
+      <p class="history-note">价格和余量均根据本机保存的刷新节点绘制，展示最近 100 个时间点。</p>
     </div>
   </dialog>
 
@@ -90,6 +121,6 @@
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="app.js?v=20260724-bugteam" defer></script>
+  <script src="app.js?v=20260725-title-rules" defer></script>
 </body>
 </html>

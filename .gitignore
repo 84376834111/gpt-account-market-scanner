@@ -23,6 +23,9 @@ data/
 artifacts/
 ldxp_*.js
 
+# Private exports from the deployed catalog
+*链接*.txt
+
 # Local agent, editor, and operating-system files
 .agents/
 .codex/
