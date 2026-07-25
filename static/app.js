@@ -6,6 +6,7 @@ const state = {
   productLoading: false,
   productRequestId: 0,
   productLoadLimit: 12,
+  productsInitialized: false,
   catalogRevision: 0,
   completedFilterKey: '',
   streamedProducts: [],
@@ -15,6 +16,7 @@ const state = {
   stats: {},
   selectedCategory: 'all',
   search: '',
+  searchSourceToken: '',
   stockOnly: true,
   minPrice: 0,
   maxPrice: null,
@@ -47,7 +49,7 @@ const $ = (selector) => document.querySelector(selector);
 let searchReloadTimer = 0;
 let nextLocalRequestAt = 0;
 const LOCAL_REQUEST_COOLDOWN_MS = 1000;
-const PRODUCT_CACHE_TTL_MS = 45_000;
+const PRODUCT_CACHE_TTL_MS = 30 * 60_000;
 const elements = {
   grid: $('#productGrid'), empty: $('#emptyState'), tabs: $('#categoryTabs'),
   total: $('#totalStat'), stock: $('#stockStat'), low: $('#lowStat'), source: $('#sourceStat'),
@@ -106,6 +108,12 @@ async function api(path, options = {}) {
 }
 
 async function loadState() {
+  const initialLoad = !state.productsInitialized;
+  if (initialLoad) {
+    state.productsInitialized = true;
+    // Start rendering the first product batch without waiting for the dashboard snapshot.
+    void reloadProducts();
+  }
   try {
     const payload = await api('api/state');
     state.sources = payload.sources || [];
@@ -120,7 +128,7 @@ async function loadState() {
     updateStats();
     renderTabs();
     renderSources();
-    await reloadProducts();
+    if (!initialLoad) await reloadProducts();
     setScanning(state.scanning, state.scanning ? '正在采集公开店铺' : '自动扫描已关闭');
   } catch (error) {
     toast(error.message, true);
@@ -193,7 +201,8 @@ function productMatchesFilters(product) {
   if (state.includeMinPrice ? price < state.minPrice : price <= state.minPrice) return false;
   if (state.maxPrice !== null && price > state.maxPrice) return false;
   const query = state.search.trim().toLocaleLowerCase();
-  return !query || `${product.name} ${product.source_name} ${product.category_name}`.toLocaleLowerCase().includes(query);
+  if (state.searchSourceToken) return product.source_token === state.searchSourceToken;
+  return !query || `${product.name} ${product.source_name} ${product.category_name} ${product.link} ${product.goods_key}`.toLocaleLowerCase().includes(query);
 }
 
 function compareProducts(a, b) {
@@ -316,13 +325,35 @@ function readCachedProductPage(params) {
   try {
     const cached = JSON.parse(localStorage.getItem(productCacheKey(params)) || 'null');
     return cached
-      && Number(cached.expires_at) > Date.now()
-      && Number(cached.catalog_revision) === state.catalogRevision
       && Array.isArray(cached.records)
       ? cached.records
       : null;
   } catch {
     return null;
+  }
+}
+
+async function refreshVisibleProducts(keys, requestId) {
+  if (!keys.length) return;
+  const params = new URLSearchParams();
+  keys.forEach((key) => params.append('key', key));
+  try {
+    const payload = await api(`api/products/visible?${params.toString()}`);
+    if (requestId !== state.productRequestId) return;
+    const fresh = new Map((payload.products || []).map((product) => [product.goods_key, product]));
+    for (const key of keys) {
+      const product = fresh.get(key);
+      if (product) {
+        state.products.set(key, product);
+        reconcileProductCard(product, 'changed');
+      } else {
+        applySingleProductRemoval(key);
+      }
+    }
+    state.catalogRevision = Number(payload.catalog_revision || state.catalogRevision);
+    updateProductLoadingControls();
+  } catch {
+    // Cached cards remain usable when the background refresh cannot complete.
   }
 }
 
@@ -345,6 +376,7 @@ function applyProductStreamRecord(record, requestId, offset) {
     state.catalogRevision = Number(record.catalog_revision || state.catalogRevision);
     state.nextProductOffset = Number(record.next_offset || offset);
     state.hasMoreProducts = Boolean(record.has_more);
+    state.searchSourceToken = String(record.search_source_token || '');
     if (!state.hasMoreProducts) state.completedFilterKey = currentFilterMappingKey();
   } else if (record.type === 'product' && record.product) {
     queueStreamedProduct(record.product);
@@ -362,6 +394,11 @@ async function loadProductBatch() {
     const cached = readCachedProductPage(query);
     if (cached) {
       cached.forEach((record) => applyProductStreamRecord(record, requestId, offset));
+      if (state.streamRenderQueued) flushStreamedProducts();
+      const visibleKeys = cached
+        .filter((record) => record.type === 'product' && record.product)
+        .map((record) => record.product.goods_key);
+      void refreshVisibleProducts(visibleKeys, requestId);
     } else {
       const records = [];
       await readProductStream(query, (record) => {
@@ -388,6 +425,7 @@ async function reloadProducts() {
   state.nextProductOffset = 0;
   state.hasMoreProducts = true;
   state.completedFilterKey = '';
+  state.searchSourceToken = '';
   state.productLoading = false;
   state.streamedProducts = [];
   elements.grid.replaceChildren();

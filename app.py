@@ -398,6 +398,17 @@ def normalize_source(value: str) -> str:
     return parse_source_reference(value).key
 
 
+def source_reference_from_link_search(value: str) -> SourceReference | None:
+    """Parse a supported public shop or item URL used in the product search box."""
+    value = (value or "").strip()
+    if not value or "://" not in value:
+        return None
+    try:
+        return parse_source_reference(value, allow_item=True)
+    except ValueError:
+        return None
+
+
 def extract_ldxp_refs(value: Any) -> tuple[set[str], set[str]]:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     return set(SHOP_REF_RE.findall(text)), set(ITEM_REF_RE.findall(text))
@@ -1449,6 +1460,21 @@ class Database:
             ).fetchall()
             return [self._product_row(row) for row in rows]
 
+    def source_token_from_link_search(self, search: str) -> str | None:
+        reference = source_reference_from_link_search(search)
+        if reference is None:
+            return None
+        if reference.remote_token:
+            return reference.key
+        if not reference.goods_key:
+            return None
+        with self.session() as db:
+            row = db.execute(
+                "SELECT source_token FROM products WHERE goods_key = ? AND active = 1",
+                (reference.goods_key,),
+            ).fetchone()
+            return str(row["source_token"]) if row is not None else None
+
     def list_product_page(
         self,
         *,
@@ -1475,7 +1501,12 @@ class Database:
             conditions.append("price <= ?")
             params.append(max_price)
         query = search.strip().lower()
-        if query:
+        source_key = self.source_token_from_link_search(search)
+        if source_key:
+            # This exact lookup uses idx_products_source instead of scanning product text.
+            conditions.append("source_token = ?")
+            params.append(source_key)
+        elif query:
             conditions.append(
                 "LOWER(name || ' ' || source_name || ' ' || category_name || ' ' || link || ' ' || goods_key) LIKE ?"
             )
@@ -1507,6 +1538,7 @@ class Database:
                 "total": total,
                 "products": [self._product_row(row) for row in rows],
                 "catalog_revision": int(revision["revision"]) if revision is not None else 0,
+                "search_source_token": source_key or "",
             }
 
     def get_product(self, goods_key: str) -> dict[str, Any] | None:
@@ -1515,6 +1547,18 @@ class Database:
                 "SELECT * FROM products WHERE goods_key = ? AND active = 1", (goods_key,)
             ).fetchone()
             return self._product_row(row) if row is not None else None
+
+    def get_visible_products(self, goods_keys: list[str]) -> list[dict[str, Any]]:
+        keys = list(dict.fromkeys(goods_keys))
+        if not keys:
+            return []
+        placeholders = ", ".join("?" for _ in keys)
+        with self.session() as db:
+            rows = db.execute(
+                f"SELECT * FROM products WHERE active = 1 AND goods_key IN ({placeholders})",
+                keys,
+            ).fetchall()
+            return [self._product_row(row) for row in rows]
 
     def deactivate_product(self, goods_key: str) -> bool:
         with self.session() as db:
@@ -3554,6 +3598,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, **self.app.snapshot(include_products=False)})
         elif path == "/api/products/stream":
             self._serve_product_stream(parsed.query)
+        elif path == "/api/products/visible":
+            raw_keys = urllib.parse.parse_qs(parsed.query, keep_blank_values=False).get("key", [])
+            keys = list(dict.fromkeys(clean_text(key, 200) for key in raw_keys if clean_text(key, 200)))
+            if len(keys) > PRODUCT_STREAM_MAX_LIMIT:
+                self._error(HTTPStatus.BAD_REQUEST, "too many product keys")
+                return
+            products = self.app.database.get_visible_products(keys)
+            self._send_json(
+                {
+                    "ok": True,
+                    "products": products,
+                    "catalog_revision": self.app.database.catalog_revision(),
+                }
+            )
         elif path == "/api/events":
             self._serve_events()
         elif path.startswith("/api/products/") and path.endswith("/refresh-status"):
@@ -3942,6 +4000,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             "offset": offset,
             "next_offset": next_offset,
             "has_more": next_offset < page["total"],
+            "search_source_token": page["search_source_token"],
         }
 
         self.send_response(HTTPStatus.OK)

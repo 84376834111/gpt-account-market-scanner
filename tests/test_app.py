@@ -38,6 +38,7 @@ from app import (
     product_refresh_interval,
     remaining_cycle_delay,
     resolve_source_reference,
+    source_reference_from_link_search,
 )
 
 
@@ -165,6 +166,18 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(reference.goods_key, "83xvh8")
         self.assertEqual(reference.key, "")
         self.assertEqual(normalize_source("catfk.com:agi"), "catfk.com:agi")
+
+    def test_recognizes_public_urls_for_exact_search(self):
+        self.assertEqual(
+            source_reference_from_link_search("https://pay.ldxp.cn/shop/CodexBro").key, "CodexBro"
+        )
+        self.assertEqual(
+            source_reference_from_link_search("https://catfk.com/shop/agi").key, "catfk.com:agi"
+        )
+        self.assertEqual(
+            source_reference_from_link_search("https://pay.ldxp.cn/item/abc123").goods_key, "abc123"
+        )
+        self.assertIsNone(source_reference_from_link_search("CodexBro"))
 
     def test_extracts_shop_and_item_references(self):
         shops, items = extract_ldxp_refs(
@@ -455,6 +468,50 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             [product["goods_key"] for product in self.db.list_product_page(search="link-search-key")["products"]],
             ["goods2"],
+        )
+
+    def test_pages_products_by_shop_link_with_exact_source_lookup(self):
+        self.db.upsert_source("second", "Second shop", origin="unit-test")
+        self.db.upsert_source(
+            "catfk.com:agi",
+            "AGI shop",
+            origin="unit-test",
+            base_url=CATFK_BASE_URL,
+            remote_token="agi",
+        )
+        self.db.upsert_product({**self.product(), "goods_key": "first"})
+        self.db.upsert_product(
+            {**self.product(), "goods_key": "second-item", "source_token": "second"}
+        )
+        self.db.upsert_product(
+            {**self.product(), "goods_key": "catfk-item", "source_token": "catfk.com:agi"}
+        )
+
+        self.assertEqual(
+            [item["goods_key"] for item in self.db.list_product_page(
+                search="https://pay.ldxp.cn/shop/second", stock_only=False
+            )["products"]],
+            ["second-item"],
+        )
+        self.assertEqual(
+            [item["goods_key"] for item in self.db.list_product_page(
+                search="https://catfk.com/shop/agi", stock_only=False
+            )["products"]],
+            ["catfk-item"],
+        )
+        self.assertEqual(
+            [item["goods_key"] for item in self.db.list_product_page(
+                search="https://pay.ldxp.cn/item/second-item", stock_only=False
+            )["products"]],
+            ["second-item"],
+        )
+
+    def test_reads_only_requested_visible_products(self):
+        self.db.upsert_product(self.product())
+        self.db.upsert_product({**self.product(), "goods_key": "second"})
+        self.assertEqual(
+            [item["goods_key"] for item in self.db.get_visible_products(["second", "missing", "second"])],
+            ["second"],
         )
 
     def test_state_snapshot_omits_products_by_default(self):
