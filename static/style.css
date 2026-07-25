@@ -49,9 +49,11 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .brand-summary:hover .brand-mark { transform: translateY(-1px); box-shadow: 0 10px 24px #101a2f22; }
 .brand-mark { display: grid; place-items: center; width: 46px; height: 46px; flex: 0 0 46px; border-radius: 14px; color: #fff; font: 800 24px/1 Georgia, serif; background: var(--navy); box-shadow: 0 7px 20px #101a2f1c; transition: .16s ease; }
 .brand-copy { min-width: 0; }
-.brand-copy strong, .brand-copy small { display: block; }
-.brand-copy strong { font-size: 17px; letter-spacing: .01em; }
-.brand-copy small { max-width: 180px; margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.brand-title-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.brand-title-row strong { font-size: 17px; letter-spacing: .01em; }
+.project-link { display: inline-flex; align-items: center; min-height: 25px; padding: 0 8px; color: #2857a8; border: 1px solid #c7d5ef; border-radius: 5px; background: #f5f8fe; font-size: 11px; font-weight: 700; text-decoration: none; }
+.project-link:hover { color: #173f85; border-color: #92addb; background: #ebf2fd; }
+.brand-copy small { display: block; max-width: 245px; margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .stats article { min-height: 108px; padding: 21px 26px; border-right: 1px solid var(--line); }
 .stats article:last-child { border-right: 0; }
 .stats article span, .stats article small { display: block; color: var(--muted); font-size: 11px; }
