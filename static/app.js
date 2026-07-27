@@ -51,13 +51,16 @@ const state = {
   commentMetrics: new Map(),
   ratingSort: false,
   commentDrawer: { goodsKey: '', comments: new Map(), images: [], quickImages: [], avatar: null },
+  locallyValidatedProducts: new Set(),
+  localValidationRunning: false,
+  localValidationTimer: 0,
 };
 const commentVoterKey = (() => { const existing = localStorage.getItem('ldxp-comment-voter'); if (existing) return existing; const key = crypto.randomUUID?.() || `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`; localStorage.setItem('ldxp-comment-voter', key); return key; })();
 
 const $ = (selector) => document.querySelector(selector);
 let searchReloadTimer = 0;
 let nextLocalRequestAt = 0;
-const LOCAL_REQUEST_COOLDOWN_MS = 1000;
+const LOCAL_REQUEST_COOLDOWN_MS = 0;
 const PRODUCT_CACHE_TTL_MS = 30 * 60_000;
 const REGULAR_USER_REFRESH_LIMIT = 24;
 const elements = {
@@ -69,6 +72,9 @@ const elements = {
   browserFactoryButton: $('#browserFactoryButton'), browserFactoryLabel: $('#browserFactoryButton .browser-factory-label'),
   browserFactoryMultiplier: $('#browserFactoryMultiplier'),
   browserFactoryStatus: $('#browserFactoryStatus'),
+  refreshOutOfStockButton: $('#refreshOutOfStockButton'),
+  refreshOffShelfButton: $('#refreshOffShelfButton'),
+  retryErrorSourcesButton: $('#retryErrorSourcesButton'),
   adminTokenInput: $('#adminTokenInput'), adminTokenVerifyButton: $('#adminTokenVerifyButton'),
   adminFullScanButton: $('#adminFullScanButton'),
   sponsoredUpdateButton: $('#sponsoredUpdateButton'),
@@ -182,13 +188,30 @@ function categoryCounts() {
   return state.stats.category_counts || {};
 }
 
+function categoryStockCounts() {
+  return state.stats.category_stock_counts || {};
+}
+
+function categoryOffShelfCounts() {
+  return state.stats.category_off_shelf_counts || {};
+}
+
 function renderTabs() {
   const counts = categoryCounts();
-  const tabs = [{ key: 'all', label: '全部', count: Number(state.stats.total || 0) }, ...state.categories.map((item) => ({ ...item, count: counts[item.key] || 0 }))];
+  const stockCounts = categoryStockCounts();
+  const offShelfCounts = categoryOffShelfCounts();
+  const tabs = [
+    { key: 'all', label: '全部', count: Number(state.stats.total || 0), stockCount: Number(state.stats.in_stock || 0), offShelfCount: Number(state.stats.active_catalog_off_shelf || 0) },
+    ...state.categories.map((item) => ({ ...item, count: counts[item.key] || 0, stockCount: stockCounts[item.key] || 0, offShelfCount: offShelfCounts[item.key] || 0 })),
+  ];
   elements.tabs.innerHTML = tabs.map((tab) => `
     <span class="category-control">
       <button type="button" class="category ${state.selectedCategory === tab.key ? 'active' : ''} ${state.refreshingTags.has(tab.key) ? 'refreshing' : ''}" data-category="${escapeHtml(tab.key)}" role="tab" aria-selected="${state.selectedCategory === tab.key}" aria-busy="${state.refreshingTags.has(tab.key)}">
-        ${escapeHtml(tab.label)} <b>${tab.count}</b><i class="refresh-indicator" title="正在刷新" aria-hidden="true"></i>
+        ${escapeHtml(tab.label)}
+        <span class="category-count category-count-total">总 ${tab.count}</span>
+        <span class="category-count category-count-stock">有货 ${tab.stockCount}</span>
+        <span class="category-count category-count-off-shelf">下架 ${tab.offShelfCount}</span>
+        <i class="refresh-indicator" title="正在刷新" aria-hidden="true"></i>
       </button>
       <button type="button" class="category-refresh" data-refresh-category="${escapeHtml(tab.key)}" title="用当前网络刷新 ${escapeHtml(tab.label)}" aria-label="用当前网络刷新 ${escapeHtml(tab.label)}" ${state.localScanning ? 'disabled' : ''}>↻</button>
     </span>`).join('');
@@ -226,11 +249,19 @@ function clearRefreshingTags() {
 
 function updateTabCounts() {
   const counts = categoryCounts();
+  const stockCounts = categoryStockCounts();
+  const offShelfCounts = categoryOffShelfCounts();
   for (const tab of elements.tabs.querySelectorAll('[data-category]')) {
     const key = tab.dataset.category;
     const count = key === 'all' ? Number(state.stats.total || 0) : (counts[key] || 0);
-    const badge = tab.querySelector('b');
-    if (badge && badge.textContent !== String(count)) badge.textContent = String(count);
+    const stockCount = key === 'all' ? Number(state.stats.in_stock || 0) : (stockCounts[key] || 0);
+    const offShelfCount = key === 'all' ? Number(state.stats.active_catalog_off_shelf || 0) : (offShelfCounts[key] || 0);
+    const totalBadge = tab.querySelector('.category-count-total');
+    const stockBadge = tab.querySelector('.category-count-stock');
+    const offShelfBadge = tab.querySelector('.category-count-off-shelf');
+    if (totalBadge && totalBadge.textContent !== `总 ${count}`) totalBadge.textContent = `总 ${count}`;
+    if (stockBadge && stockBadge.textContent !== `有货 ${stockCount}`) stockBadge.textContent = `有货 ${stockCount}`;
+    if (offShelfBadge && offShelfBadge.textContent !== `下架 ${offShelfCount}`) offShelfBadge.textContent = `下架 ${offShelfCount}`;
   }
 }
 
@@ -396,6 +427,7 @@ function flushStreamedProducts() {
   }
   elements.grid.appendChild(fragment);
   void loadCommentPreviews([...elements.grid.children].map((card) => card.dataset.key));
+  void validateVisibleProductsLocally([...elements.grid.children].map((card) => card.dataset.key));
   updateProductLoadingControls();
 }
 
@@ -531,6 +563,7 @@ function sortCompletedFilterMapping() {
   for (const product of products) fragment.appendChild(createProductCard(product));
   elements.grid.replaceChildren(fragment);
   void loadCommentPreviews(products.map((product) => product.goods_key));
+  void validateVisibleProductsLocally(products.map((product) => product.goods_key));
   updateVisibleSummary();
 }
 
@@ -605,7 +638,9 @@ function productCard(product, index) {
 function createProductCard(product) {
   const template = document.createElement('template');
   template.innerHTML = productCard(product, 0).trim();
-  return template.content.firstElementChild;
+  const card = template.content.firstElementChild;
+  card.dataset.displayedAt = String(Date.now());
+  return card;
 }
 
 function findProductCard(goodsKey) {
@@ -750,6 +785,7 @@ function updateAdminProxyScanButton() {
     : '代理全量扫描';
   elements.priceaiSyncButton.disabled = state.priceaiSyncStarting || state.priceaiSyncing || !state.adminVerified;
   elements.browserFactoryButton.disabled = state.localScanning;
+  elements.retryErrorSourcesButton.disabled = state.localScanning;
   elements.priceaiSyncButton.classList.toggle('scanning', state.priceaiSyncing);
   elements.priceaiSyncButton.textContent = state.priceaiSyncing ? 'PriceAI 同步中' : '同步 PriceAI';
   if (!state.localScanning) {
@@ -894,6 +930,8 @@ function setLocalScanning(scanning, detail = '', label = '', target = state.loca
   state.localScanTarget = scanning ? target : '';
   const busy = scanning || state.scanning;
   elements.localScanButton.disabled = scanning;
+  elements.refreshOutOfStockButton.disabled = scanning;
+  elements.refreshOffShelfButton.disabled = scanning;
   if (elements.filteredLocalScanButton) elements.filteredLocalScanButton.disabled = scanning;
   elements.localScanButton.classList.toggle('scanning', scanning && target === 'all');
   elements.filteredLocalScanButton?.classList.toggle('scanning', scanning && target === 'filter');
@@ -1215,6 +1253,77 @@ async function openPriceHistory(goodsKey) {
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+for (const closeButton of document.querySelectorAll('.side-ad-close')) {
+  closeButton.addEventListener('click', () => closeButton.closest('.side-ad')?.remove());
+}
+for (const carousel of document.querySelectorAll('[data-ad-carousel]')) {
+  const images = [...carousel.querySelectorAll(':scope > img')];
+  const dots = [...carousel.querySelectorAll('.side-ad-dots i')];
+  let index = 0; let timer = 0; let startX = 0; let pointerId = null; let suppressPreviewUntil = 0;
+  images.forEach((image) => { image.draggable = false; });
+  const showSlide = (nextIndex) => {
+    index = (nextIndex + images.length) % images.length;
+    images.forEach((image, position) => image.classList.toggle('active', position === index));
+    dots.forEach((dot, position) => dot.classList.toggle('active', position === index));
+  };
+  const restartAuto = () => {
+    clearInterval(timer);
+    if (images.length > 1) timer = setInterval(() => showSlide(index + 1), 4000);
+  };
+  restartAuto();
+  dots.forEach((dot, position) => dot.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    showSlide(position);
+    restartAuto();
+  }));
+  carousel.addEventListener('pointerdown', (event) => {
+    if (event.target.closest('.side-ad-dots')) return;
+    if (images.length < 2) return;
+    pointerId = event.pointerId;
+    startX = event.clientX;
+    carousel.setPointerCapture(pointerId);
+    carousel.classList.add('dragging');
+  });
+  carousel.addEventListener('pointerup', (event) => {
+    if (pointerId !== event.pointerId) return;
+    const distance = event.clientX - startX;
+    carousel.releasePointerCapture(pointerId);
+    carousel.classList.remove('dragging');
+    pointerId = null;
+    if (Math.abs(distance) >= 32) {
+      showSlide(index + (distance < 0 ? 1 : -1));
+      suppressPreviewUntil = Date.now() + 350;
+      restartAuto();
+    }
+  });
+  carousel.addEventListener('pointercancel', () => {
+    pointerId = null;
+    carousel.classList.remove('dragging');
+  });
+  carousel.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight'].includes(event.key) || images.length < 2) return;
+    event.preventDefault();
+    showSlide(index + (event.key === 'ArrowRight' ? 1 : -1));
+    restartAuto();
+  });
+  carousel.addEventListener('click', () => {
+    if (Date.now() < suppressPreviewUntil) return;
+    const active = images.find((image) => image.classList.contains('active')) || images[0];
+    if (!active) return;
+    const preview = document.querySelector('#adPreviewDialog');
+    const previewImage = document.querySelector('#adPreviewImage');
+    previewImage.src = active.currentSrc || active.src;
+    previewImage.alt = active.alt || '广告宣传大图';
+    if (!preview.open) preview.showModal();
+  });
+}
+const adPreviewDialog = document.querySelector('#adPreviewDialog');
+document.querySelector('#adPreviewClose')?.addEventListener('click', () => adPreviewDialog.close());
+adPreviewDialog?.addEventListener('click', (event) => {
+  if (event.target === adPreviewDialog) adPreviewDialog.close();
+});
+
 async function joinServerProductRefresh(goodsKey) {
   setProductRefreshing(goodsKey, true);
   toast('服务器正在刷新同店数据，正在接收对应商品更新');
@@ -1512,10 +1621,111 @@ async function collectLocalSource(source) {
     const compact = compactLocalItem(item, item?.goods_type || '');
     if (compact.goods_key) items.set(compact.goods_key, compact);
   }
+  if (source.validation_required || ['error', 'paused', 'pending'].includes(source.status)) {
+    for (const [goodsKey, listing] of items) {
+      const detail = await localMarketplacePost(baseUrl, '/shopApi/Shop/goodsInfo', { goods_key: goodsKey });
+      const compact = compactLocalItem({
+        ...listing,
+        ...detail,
+        category: detail?.category || listing.category,
+        goods_type: detail?.goods_type || listing.goods_type,
+      }, detail?.goods_type || listing.goods_type || '');
+      items.set(goodsKey, compact);
+    }
+  }
   return {
     sourceName: String(shop?.nickname || source.name || source.token).slice(0, 200),
     items: [...items.values()],
   };
+}
+
+async function collectSourceWithLocalHelper(source) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10 * 60_000);
+  try {
+    const response = await fetch('http://127.0.0.1:18766/scan-source', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source }),
+      signal: controller.signal,
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `本地助手返回 HTTP ${response.status}`);
+    return { sourceName: payload.source_name || source.name || source.token, items: payload.items || [] };
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('本地采集助手扫描超时');
+    if (error instanceof TypeError) throw new Error('未检测到本地网页采集助手，请先运行“本地网页采集助手.bat”');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function scheduleVisibleProductValidation(goodsKeys = []) {
+  for (const key of goodsKeys) {
+    const card = findProductCard(key);
+    if (card && !card.dataset.displayedAt) card.dataset.displayedAt = String(Date.now());
+  }
+  clearTimeout(state.localValidationTimer);
+  const pending = [...elements.grid.children]
+    .filter((card) => !state.locallyValidatedProducts.has(card.dataset.key));
+  if (!pending.length) return;
+  const earliest = Math.min(...pending.map((card) => Number(card.dataset.displayedAt || Date.now()) + 10_000));
+  state.localValidationTimer = setTimeout(() => { void validateVisibleProductsLocally(); }, Math.max(0, earliest - Date.now()));
+}
+
+async function refillValidatedProducts(targetCount) {
+  if (elements.grid.children.length >= targetCount) return;
+  const requestId = state.productRequestId;
+  const query = currentProductQuery(Math.min(500, targetCount), 0);
+  await readProductStream(query, (record) => applyProductStreamRecord(record, requestId, 0));
+  if (state.streamRenderQueued) flushStreamedProducts();
+}
+
+async function validateVisibleProductsLocally() {
+  if (state.localValidationRunning || state.localScanning) {
+    scheduleVisibleProductValidation();
+    return;
+  }
+  const now = Date.now();
+  const products = [...elements.grid.children]
+    .filter((card) => now - Number(card.dataset.displayedAt || now) >= 10_000)
+    .map((card) => state.products.get(card.dataset.key))
+    .filter((product) => product && !product.off_shelf && !product.platform_banned
+      && !state.locallyValidatedProducts.has(product.goods_key))
+    .slice(0, 12);
+  if (!products.length) {
+    scheduleVisibleProductValidation();
+    return;
+  }
+  state.localValidationRunning = true;
+  products.forEach((product) => state.locallyValidatedProducts.add(product.goods_key));
+  try {
+    const response = await fetch('http://127.0.0.1:18766/verify-products', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        products: products.map(({ goods_key, link }) => ({ goods_key, link })),
+      }),
+    });
+    const local = await response.json();
+    if (!response.ok || !local.ok) throw new Error(local.error || '本地商品核验失败');
+    const summary = await api('api/local-validation/products', {
+      method: 'POST', body: JSON.stringify({ results: local.results || [] }),
+    });
+    const unavailableKeys = summary.unavailable_keys || [];
+    if (unavailableKeys.length) {
+      const targetCount = elements.grid.children.length;
+      unavailableKeys.forEach((key) => applySingleProductRemoval(key));
+      await refillValidatedProducts(targetCount);
+    }
+    if (Number(summary.changed || 0) > 0) await loadState();
+  } catch (error) {
+    if (!(error instanceof TypeError)) console.warn('Visible product validation failed:', error);
+  } finally {
+    state.localValidationRunning = false;
+    scheduleVisibleProductValidation();
+  }
 }
 
 function groupLocalProducts(products) {
@@ -1689,21 +1899,91 @@ async function localFilteredScan(scopeLabel = '当前筛选') {
   }
 }
 
-async function runBrowserFactory() {
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function waitForServerRefreshBatch() {
+  while (true) {
+    const status = await api('api/category-refresh/server-status');
+    elements.browserFactoryStatus.textContent = `服务器刷新 ${status.completed || 0}/${status.total || 0}`;
+    if (!status.running) return status;
+    await wait(800);
+  }
+}
+
+async function runAlternatingCategoryRefresh(availability, scopeLabel) {
+  if (state.localScanning) return;
+  const category = state.selectedCategory;
+  const cycleId = crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const payload = { category, availability, limit: 50, cycle_id: cycleId };
+  let processed = 0;
+  let targetTotal = null;
+  let failed = 0;
+  setLocalScanning(true, `准备刷新${scopeLabel}`, '准备任务', 'filter');
+  elements.browserFactoryStatus.classList.remove('success', 'error');
+  try {
+    while (targetTotal === null || processed < targetTotal) {
+      const clientBatch = await api('api/user-refresh/claim', {
+        method: 'POST', body: JSON.stringify(payload),
+      });
+      if (targetTotal === null) targetTotal = Number(clientBatch.total || 0);
+      const clientProducts = (clientBatch.products || []).slice(0, Math.max(0, targetTotal - processed));
+      if (!clientProducts.length) break;
+      elements.browserFactoryStatus.textContent = `本机刷新 ${processed}/${targetTotal}`;
+      const local = await refreshLocalProducts(clientProducts, (_source, current, total) => {
+        elements.browserFactoryStatus.textContent = `本机刷新 ${processed + current}/${targetTotal} · 店铺 ${current}/${total}`;
+      });
+      processed += clientProducts.length;
+      failed += Number(local.failed || 0);
+      if (processed >= targetTotal) break;
+
+      const serverLimit = Math.min(50, targetTotal - processed);
+      const server = await api('api/category-refresh/server', {
+        method: 'POST', body: JSON.stringify({ ...payload, limit: serverLimit }),
+      });
+      if (!server.started) {
+        await waitForServerRefreshBatch();
+        continue;
+      }
+      const serverResult = await waitForServerRefreshBatch();
+      processed += Number(serverResult.total || serverLimit);
+      failed += Number(serverResult.failed || 0);
+    }
+    elements.browserFactoryStatus.textContent = `${scopeLabel}完成 ${Math.min(processed, targetTotal || 0)}/${targetTotal || 0}`;
+    elements.browserFactoryStatus.classList.add(failed ? 'error' : 'success');
+    toast(`${scopeLabel}刷新完成：${Math.min(processed, targetTotal || 0)} 件，失败 ${failed} 件`, failed > 0);
+  } catch (error) {
+    elements.browserFactoryStatus.textContent = `${scopeLabel}中断：${error.message}`;
+    elements.browserFactoryStatus.classList.add('error');
+    toast(error.message, true);
+  } finally {
+    setLocalScanning(false, '', '', 'filter');
+    await loadState();
+  }
+}
+
+function refreshCurrentCategory() {
+  const stockOnly = ['plus_sms', 'k12'].includes(state.selectedCategory);
+  const availability = stockOnly ? 'stock' : 'all';
+  const label = stockOnly ? '当前分类有货商品' : '当前分类全部在售商品';
+  return runAlternatingCategoryRefresh(availability, label);
+}
+
+async function runBrowserFactory(errorSourcesOnly = false) {
   if (state.localScanning) return;
   elements.browserFactoryStatus.textContent = '正在领取任务...';
   elements.browserFactoryStatus.classList.remove('success', 'error');
   setLocalScanning(true, '正在领取服务器刷新任务', '工厂任务准备中', 'filter');
   try {
-    const multiplier = Math.max(1, Math.min(5, Math.trunc(Number(elements.browserFactoryMultiplier.value) || 1)));
-    elements.browserFactoryMultiplier.value = String(multiplier);
-    const allocation = await api('api/browser-factory/claim', {
+    const multiplier = errorSourcesOnly ? 1 : Math.max(1, Math.min(5, Math.trunc(Number(elements.browserFactoryMultiplier.value) || 1)));
+    if (!errorSourcesOnly) elements.browserFactoryMultiplier.value = String(multiplier);
+    const allocation = await api(errorSourcesOnly ? 'api/browser-factory/claim-errors' : 'api/browser-factory/claim', {
       method: 'POST', body: JSON.stringify({ multiplier }),
     });
     const sources = allocation.sources || [];
     if (!sources.length) {
-      toast('当前没有可领取的服务器刷新任务');
-      elements.browserFactoryStatus.textContent = '当前没有可领取任务';
+      const emptyMessage = errorSourcesOnly ? '当前没有可重试的异常采集源' : '当前没有可领取的服务器刷新任务';
+      toast(emptyMessage);
+      elements.browserFactoryStatus.textContent = emptyMessage;
       return;
     }
     let completed = 0; let failed = 0; let matched = 0;
@@ -1713,7 +1993,9 @@ async function runBrowserFactory() {
       elements.browserFactoryStatus.textContent = `${index + 1}/${sources.length} · 成功 ${completed} · 失败 ${failed} · ${source.name || source.token}`;
       setLocalScanning(true, `正在刷新 ${source.name || source.token}`, `工厂任务 ${index + 1}/${sources.length}`, 'filter');
       try {
-        const collected = await collectLocalSource(source);
+        const collected = errorSourcesOnly
+          ? await collectSourceWithLocalHelper(source)
+          : await collectLocalSource(source);
         const result = await api('api/local-scan/source', {
           method: 'POST',
           body: JSON.stringify({
@@ -1729,7 +2011,15 @@ async function runBrowserFactory() {
         elements.browserFactoryStatus.textContent = `${index + 1}/${sources.length} · 成功 ${completed} · 失败 ${failed} · 匹配 ${matched}`;
       } catch (error) {
         failed += 1;
-        elements.browserFactoryStatus.textContent = `${index + 1}/${sources.length} · 成功 ${completed} · 失败 ${failed} · ${source.name || source.token}`;
+        const reason = String(error.message || error).slice(0, 80);
+        elements.browserFactoryStatus.textContent = `${index + 1}/${sources.length} · 成功 ${completed} · 失败 ${failed} · ${reason}`;
+        try {
+          await api('api/browser-factory/release', {
+            method: 'POST', body: JSON.stringify({ token: source.token, lease_id: allocation.lease_id }),
+          });
+        } catch (releaseError) {
+          console.warn(`Browser factory lease release failed for ${source.token}:`, releaseError);
+        }
         console.warn(`Browser factory task failed for ${source.token}:`, error);
       }
     }
@@ -1978,7 +2268,7 @@ document.addEventListener('click', (event) => {
     state.selectedCategory = category;
     renderTabs();
     renderProducts();
-    void localFilteredScan(label);
+    void refreshCurrentCategory();
     return;
   }
   if (tab) {
@@ -2022,6 +2312,13 @@ elements.adminTokenInput.addEventListener('input', () => {
 elements.adminFullScanButton.addEventListener('click', () => { void startServerFullScan(); });
 elements.sponsoredUpdateButton.addEventListener('click', () => { void startSponsoredUpdate(); });
 elements.browserFactoryButton.addEventListener('click', () => { void runBrowserFactory(); });
+elements.refreshOutOfStockButton.addEventListener('click', () => {
+  void runAlternatingCategoryRefresh('out_of_stock', '当前分类缺货商品');
+});
+elements.refreshOffShelfButton.addEventListener('click', () => {
+  void runAlternatingCategoryRefresh('off_shelf', '当前分类下架商品');
+});
+elements.retryErrorSourcesButton.addEventListener('click', () => { void runBrowserFactory(true); });
 elements.adminProxyScanButton.addEventListener('click', () => { void startAdminProxyScan(); });
 elements.priceaiSyncButton.addEventListener('click', () => { void startPriceaiSync(); });
 elements.historyModes.addEventListener('click', (event) => {

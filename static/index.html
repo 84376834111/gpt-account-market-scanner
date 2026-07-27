@@ -5,9 +5,49 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#101a2f">
   <title>LDXP 扫货台</title>
-  <link rel="stylesheet" href="style.css?v=20260727-public-release">
+  <link rel="stylesheet" href="style.css?v=20260728-compact-console">
 </head>
 <body>
+  <aside class="side-ad side-ad-left" aria-label="左侧推广">
+    <button class="side-ad-close" type="button" title="关闭广告" aria-label="关闭左侧广告">&times;</button>
+    <div class="side-ad-ribbon">社区推荐</div>
+    <a class="side-ad-group" href="mqqapi://card/show_pslcard?src_type=internal&amp;version=1&amp;uin=1057683663&amp;card_type=group&amp;source=qrcode">
+      <span class="side-ad-group-row"><span class="side-ad-avatar"><img src="images/ads/qq-avatar.png" alt="量大管饱研究院群头像"></span><span><strong>量大管饱研究院</strong><small>QQ群 1057683663</small></span></span>
+      <span>点击申请加入</span>
+    </a>
+    <nav class="side-ad-links" aria-label="推广快捷链接">
+      <a href="mqqapi://card/show_pslcard?src_type=internal&amp;version=1&amp;uin=1057683663&amp;card_type=group&amp;source=qrcode">QQ群直达</a>
+      <a href="https://pay.ldxp.cn/" target="_blank" rel="noopener noreferrer">小铺搜索</a>
+      <a href="https://pay.ldxp.cn/" target="_blank" rel="noopener noreferrer">链接直跳</a>
+    </nav>
+    <div class="side-ad-carousel" role="button" tabindex="0" title="查看宣传大图" data-ad-carousel>
+      <img class="active" src="images/ads/meme.jpg" alt="QQ群宣传图"><img src="images/ads/pricing.png" alt="GPT 特惠分组说明">
+      <span class="side-ad-dots" aria-hidden="true"><i class="active"></i><i></i></span>
+    </div>
+    <p>广告位可更新 · 支持动图</p>
+  </aside>
+  <aside class="side-ad side-ad-right" aria-label="右侧推广">
+    <button class="side-ad-close" type="button" title="关闭广告" aria-label="关闭右侧广告">&times;</button>
+    <div class="side-ad-ribbon">社区推荐</div>
+    <a class="side-ad-group" href="mqqapi://card/show_pslcard?src_type=internal&amp;version=1&amp;uin=1057683663&amp;card_type=group&amp;source=qrcode">
+      <span class="side-ad-group-row"><span class="side-ad-avatar"><img src="images/ads/qq-avatar.png" alt="量大管饱研究院群头像"></span><span><strong>量大管饱研究院</strong><small>QQ群 1057683663</small></span></span>
+      <span>点击申请加入</span>
+    </a>
+    <nav class="side-ad-links" aria-label="推广快捷链接">
+      <a href="mqqapi://card/show_pslcard?src_type=internal&amp;version=1&amp;uin=1057683663&amp;card_type=group&amp;source=qrcode">QQ群直达</a>
+      <a href="https://pay.ldxp.cn/" target="_blank" rel="noopener noreferrer">小铺搜索</a>
+      <a href="https://pay.ldxp.cn/" target="_blank" rel="noopener noreferrer">链接直跳</a>
+    </nav>
+    <div class="side-ad-carousel" role="button" tabindex="0" title="查看宣传大图" data-ad-carousel>
+      <img class="active" src="images/ads/meme.jpg" alt="QQ群宣传图"><img src="images/ads/pricing.png" alt="GPT 特惠分组说明">
+      <span class="side-ad-dots" aria-hidden="true"><i class="active"></i><i></i></span>
+    </div>
+    <p>广告位可更新 · 支持动图</p>
+  </aside>
+  <dialog id="adPreviewDialog" class="ad-preview-dialog">
+    <button id="adPreviewClose" class="ad-preview-close" type="button" aria-label="关闭大图">&times;</button>
+    <img id="adPreviewImage" src="" alt="广告宣传大图">
+  </dialog>
   <div class="shell">
     <main>
       <section class="stats" aria-label="统计信息">
@@ -32,7 +72,7 @@
           </div>
           <div class="category-actions">
             <span id="streamStatus" class="stream-status offline"><i></i><span>正在连接</span></span>
-            <div class="admin-controls">
+            <div class="admin-controls" hidden>
               <label class="admin-token"><span>管理员令牌</span><input id="adminTokenInput" type="password" autocomplete="off" placeholder="输入 Token"></label>
               <button id="adminTokenVerifyButton" class="button ghost admin-scan-button" type="button">验证</button>
               <button id="adminFullScanButton" class="button ghost admin-scan-button" type="button" disabled title="服务器全量更新暂时停用">服务器全量更新 · 暂停</button>
@@ -40,13 +80,20 @@
               <button id="adminProxyScanButton" class="button ghost admin-scan-button" type="button" title="仅通过代理池扫描">代理全量扫描</button>
               <button id="priceaiSyncButton" class="button ghost admin-scan-button" type="button">同步 PriceAI</button>
             </div>
-            <button id="sourceButton" class="button ghost" type="button">采集源</button>
+            <div class="source-tools">
+              <button id="sourceButton" class="button ghost" type="button">采集源</button>
+              <button id="retryErrorSourcesButton" class="button ghost" type="button" title="领取最多 24 个异常来源，使用当前设备网络重试">重试采集源错误</button>
+            </div>
             <div class="scan-actions">
-              <button id="localScanButton" class="button primary local-scan-button" type="button"><span class="scan-icon">↯</span><span class="local-scan-label">本地全部扫描</span></button>
+              <button id="localScanButton" class="button primary local-scan-button" type="button" hidden><span class="scan-icon">↯</span><span class="local-scan-label">本地全部扫描</span></button>
               <div class="factory-claim-control">
-                <button id="browserFactoryButton" class="button ghost local-scan-button" type="button"><span class="scan-icon">↻</span><span class="browser-factory-label">领取 24 个刷新任务</span></button>
+                <button id="browserFactoryButton" class="button primary local-scan-button" type="button"><span class="scan-icon">↻</span><span class="browser-factory-label">赞助刷新商品</span></button>
                 <label class="factory-multiplier" title="每次领取 24 × 倍率个任务"><span>倍率</span><input id="browserFactoryMultiplier" type="number" min="1" max="5" step="1" value="1" inputmode="numeric"></label>
                 <span id="browserFactoryStatus" class="factory-claim-status" aria-live="polite">等待领取</span>
+              </div>
+              <div class="category-refresh-actions">
+                <button id="refreshOutOfStockButton" class="button ghost" type="button">刷新当前分类缺货</button>
+                <button id="refreshOffShelfButton" class="button ghost danger" type="button">刷新当前分类下架</button>
               </div>
             </div>
             <span class="factory-scan-notice">请勿频繁点击，一两次即可，避免触发平台封控。感谢您的帮助。</span>
@@ -73,6 +120,7 @@
             <label class="select-label">排序
               <select id="sortSelect">
                 <option value="updated">最近变化</option>
+                <option value="updated_asc">最近变化（反向）</option>
                 <option value="price" selected>价格从低到高</option>
                 <option value="stock">库存从高到低</option>
               </select>
@@ -172,6 +220,6 @@
   <aside id="sourceImportProgress" class="source-import-progress" aria-live="polite" hidden>
     <strong>Source Refresh</strong><span id="sourceImportProgressText"></span>
   </aside>
-  <script src="app.js?v=20260727-public-release" defer></script>
+  <script src="app.js?v=20260728-reverse-updated" defer></script>
 </body>
 </html>

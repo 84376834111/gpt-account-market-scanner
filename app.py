@@ -122,14 +122,18 @@ COMMENT_MAX_IMAGES = 5
 COMMENT_IMAGE_MAX_BYTES = 900 * 1024
 COMMENT_AVATAR_MAX_BYTES = 100 * 1024
 UNKNOWN_OR_ZERO_REFRESH_INTERVAL = 6 * 60 * 60
-LOW_STOCK_REFRESH_INTERVAL = 20 * 60
-NORMAL_STOCK_REFRESH_INTERVAL = 45 * 60
-HIGH_STOCK_REFRESH_INTERVAL = 90 * 60
+LOW_STOCK_REFRESH_INTERVAL = 3 * 60
+RECENT_CHANGE_REFRESH_INTERVAL = 5 * 60
+NORMAL_STOCK_REFRESH_INTERVAL = 10 * 60
+HIGH_STOCK_REFRESH_INTERVAL = 15 * 60
+HOT_CHANGE_AGE = 30 * 60
+RECENT_CHANGE_AGE = 12 * 60 * 60
+DAILY_CHANGE_AGE = 24 * 60 * 60
 OUT_OF_STOCK_REFRESH_INTERVALS = (
-    (24 * 60 * 60, 2 * 60 * 60),
+    (24 * 60 * 60, 60 * 60),
     (float("inf"), 24 * 60 * 60),
 )
-# A newly confirmed shortage is checked every two hours. After a full day it
+# A newly confirmed shortage is checked every hour. After a full day it
 # leaves the ordinary visitor-triggered lane and enters the daily ultra-lazy lane.
 LAZY_OUT_OF_STOCK_AFTER = 24 * 60 * 60
 LAZY_REFRESH_INTERVAL = 24 * 60 * 60
@@ -173,7 +177,17 @@ CATEGORY_DEFINITIONS = [
 ]
 OFF_SHELF_CATEGORY = {"key": "off_shelf", "label": "已下架"}
 PLATFORM_BANNED_CATEGORY = {"key": "platform_banned", "label": "已被平台封禁"}
-PRODUCT_CATEGORY_DEFINITIONS = [*CATEGORY_DEFINITIONS, OFF_SHELF_CATEGORY, PLATFORM_BANNED_CATEGORY]
+ACTIVE_CATEGORY_KEYS = ("plus_sms", "team", "bugteam", "k12")
+PRODUCT_CATEGORY_DEFINITIONS = [
+    item for item in CATEGORY_DEFINITIONS if item["key"] in ACTIVE_CATEGORY_KEYS
+]
+ACTIVE_CATALOG_SQL = "(" + " OR ".join(
+    f"tags LIKE '%\"{key}\"%'" for key in ACTIVE_CATEGORY_KEYS
+) + ")"
+
+
+def is_active_catalog_tags(tags: list[str]) -> bool:
+    return any(tag in ACTIVE_CATEGORY_KEYS for tag in tags)
 
 # Additional title terms and exclusions distilled from the current catalog.  The
 # base definitions retain the established category vocabulary; these filters make
@@ -375,7 +389,7 @@ def remaining_cycle_delay(interval: float, elapsed: float) -> float:
 
 
 def product_refresh_interval(product: dict[str, Any], timestamp: int | None = None) -> int:
-    """Return the conservative next-refresh interval for a product snapshot."""
+    """Return an adaptive interval based on availability and recent changes."""
     timestamp = timestamp if timestamp is not None else now_ts()
     price = float(product.get("price") or 0)
     stock = safe_int(product.get("stock_count"), -1)
@@ -389,7 +403,16 @@ def product_refresh_interval(product: dict[str, Any], timestamp: int | None = No
                 return interval
     if stock <= 2:
         return LOW_STOCK_REFRESH_INTERVAL
-    if stock <= 9:
+    changed_at = safe_int(product.get("changed_at"), 0)
+    if changed_at:
+        unchanged_age = max(0, timestamp - changed_at)
+        if unchanged_age <= HOT_CHANGE_AGE:
+            return LOW_STOCK_REFRESH_INTERVAL
+        if unchanged_age <= RECENT_CHANGE_AGE:
+            return RECENT_CHANGE_REFRESH_INTERVAL
+        if unchanged_age <= DAILY_CHANGE_AGE:
+            return NORMAL_STOCK_REFRESH_INTERVAL
+    if stock <= 9 and not changed_at:
         return NORMAL_STOCK_REFRESH_INTERVAL
     return HIGH_STOCK_REFRESH_INTERVAL
 
@@ -615,6 +638,7 @@ class Database:
                     last_error TEXT NOT NULL DEFAULT '',
                     last_scan INTEGER NOT NULL DEFAULT 0,
                     product_count INTEGER NOT NULL DEFAULT 0,
+                    validation_required INTEGER NOT NULL DEFAULT 1,
                     origin TEXT NOT NULL DEFAULT 'manual',
                     source_kind TEXT NOT NULL DEFAULT 'shop_api',
                     created_at INTEGER NOT NULL,
@@ -812,6 +836,13 @@ class Database:
                 db.execute("ALTER TABLE sources ADD COLUMN base_url TEXT NOT NULL DEFAULT ''")
             if "entry_goods_key" not in source_columns:
                 db.execute("ALTER TABLE sources ADD COLUMN entry_goods_key TEXT NOT NULL DEFAULT ''")
+            if "validation_required" not in source_columns:
+                db.execute(
+                    "ALTER TABLE sources ADD COLUMN validation_required INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    "UPDATE sources SET validation_required = 1 WHERE status IN ('error', 'paused', 'pending')"
+                )
             product_columns = {row["name"] for row in db.execute("PRAGMA table_info(products)")}
             if "out_of_stock_since" not in product_columns:
                 db.execute(
@@ -1314,29 +1345,44 @@ class Database:
         with self.session() as db:
             return [dict(row) for row in db.execute(sql)]
 
-    def list_sources_due_for_scan(self, *, scheduled: bool) -> list[dict[str, Any]]:
+    def list_sources_due_for_scan(
+        self, *, scheduled: bool, in_stock_only: bool = False
+    ) -> list[dict[str, Any]]:
         """Order sources by the earliest product refresh deadline they contain."""
         if not scheduled:
             with self.session() as db:
                 return [
                     dict(row)
                     for row in db.execute(
-                        "SELECT * FROM sources "
-                        "WHERE enabled = 1 AND source_kind IN ('shop_api', 'snapshot') "
-                        "AND (NOT EXISTS (SELECT 1 FROM products "
-                        "                WHERE products.source_token = sources.token AND products.active = 1) "
-                        "     OR EXISTS (SELECT 1 FROM products "
-                        "                WHERE products.source_token = sources.token "
-                        "                  AND products.active = 1 AND products.off_shelf = 0)) "
-                        "ORDER BY created_at ASC"
+                        f"""
+                        SELECT * FROM sources
+                        WHERE enabled = 1 AND source_kind IN ('shop_api', 'snapshot')
+                          AND (
+                            NOT EXISTS (
+                              SELECT 1 FROM products
+                              WHERE products.source_token = sources.token AND products.active = 1
+                            )
+                            OR EXISTS (
+                              SELECT 1 FROM products
+                              WHERE products.source_token = sources.token
+                                AND products.active = 1 AND products.off_shelf = 0
+                                AND products.platform_banned = 0 AND {ACTIVE_CATALOG_SQL}
+                            )
+                          )
+                        ORDER BY created_at ASC
+                        """
                     )
                 ]
         timestamp = now_ts()
         with self.session() as db:
+            product_filter = " AND in_stock = 1 AND stock_count > 0" if in_stock_only else ""
             rows = db.execute(
-                """
-                SELECT source_token, price, stock_count, last_seen, out_of_stock_since, platform_banned
-                FROM products WHERE active = 1 AND off_shelf = 0
+                f"""
+                SELECT source_token, price, stock_count, last_seen, changed_at,
+                       out_of_stock_since, platform_banned
+                FROM products WHERE active = 1 AND off_shelf = 0 AND platform_banned = 0
+                AND {ACTIVE_CATALOG_SQL}
+                {product_filter}
                 """
             ).fetchall()
             next_refresh_by_source: dict[str, int] = {}
@@ -1500,6 +1546,10 @@ class Database:
         if scanned:
             fields.append("last_scan = ?")
             values.append(now_ts())
+        if status in {"error", "paused", "pending"}:
+            fields.append("validation_required = 1")
+        elif status in {"ok", "banned"} and scanned:
+            fields.append("validation_required = 0")
         values.append(token)
         with self.session() as db:
             db.execute(f"UPDATE sources SET {', '.join(fields)} WHERE token = ?", values)
@@ -1802,6 +1852,17 @@ class Database:
                 )
             }
 
+    def cold_product_keys(self, source_token: str) -> set[str]:
+        with self.session() as db:
+            return {
+                str(row["goods_key"])
+                for row in db.execute(
+                    f"SELECT goods_key FROM products WHERE source_token = ? AND active = 1 "
+                    f"AND NOT {ACTIVE_CATALOG_SQL}",
+                    (source_token,),
+                )
+            }
+
     def source_token_from_link_search(self, search: str) -> str | None:
         reference = source_reference_from_link_search(search)
         if reference is None:
@@ -1812,7 +1873,8 @@ class Database:
             return None
         with self.session() as db:
             row = db.execute(
-                "SELECT source_token FROM products WHERE goods_key = ? AND active = 1",
+                f"SELECT source_token FROM products WHERE goods_key = ? AND active = 1 "
+                f"AND off_shelf = 0 AND platform_banned = 0 AND {ACTIVE_CATALOG_SQL}",
                 (reference.goods_key,),
             ).fetchone()
             return str(row["source_token"]) if row is not None else None
@@ -1833,20 +1895,12 @@ class Database:
         offset: int = 0,
         limit: int = PRODUCT_STREAM_DEFAULT_LIMIT,
     ) -> dict[str, Any]:
-        conditions = ["active = 1"]
+        conditions = ["active = 1", "off_shelf = 0", "platform_banned = 0", ACTIVE_CATALOG_SQL]
         params: list[Any] = []
-        if category == OFF_SHELF_CATEGORY["key"]:
-            conditions.append("off_shelf = 1")
-            conditions.append("platform_banned = 0")
-        elif category == PLATFORM_BANNED_CATEGORY["key"]:
-            conditions.append("platform_banned = 1")
-        else:
-            conditions.append("off_shelf = 0")
-            conditions.append("platform_banned = 0")
-        if category not in {"all", OFF_SHELF_CATEGORY["key"], PLATFORM_BANNED_CATEGORY["key"]}:
+        if category != "all":
             conditions.append("tags LIKE ?")
             params.append(f'%"{category}"%')
-        if stock_only and category not in {OFF_SHELF_CATEGORY["key"], PLATFORM_BANNED_CATEGORY["key"]}:
+        if stock_only:
             conditions.append("in_stock = 1")
         if exclude_lazy_refresh:
             # Visitor refresh batches must never include archived listings, a
@@ -1878,6 +1932,7 @@ class Database:
             "price": "price ASC, name COLLATE NOCASE ASC, goods_key ASC",
             "stock": "stock_count DESC, price ASC, name COLLATE NOCASE ASC, goods_key ASC",
             "updated": "changed_at DESC, price ASC, goods_key ASC",
+            "updated_asc": "changed_at ASC, price ASC, goods_key ASC",
         }[sort]
         if oldest_seen_first:
             order_by = "last_seen ASC, first_seen ASC, goods_key ASC"
@@ -1923,6 +1978,36 @@ class Database:
                 "SELECT * FROM products WHERE goods_key = ? AND active = 1", (goods_key,)
             ).fetchone()
             return self._product_row(row) if row is not None else None
+
+    def list_refresh_candidates(
+        self, *, category: str, availability: str, limit: int = 50
+    ) -> dict[str, Any]:
+        conditions = ["active = 1", "platform_banned = 0", ACTIVE_CATALOG_SQL]
+        params: list[Any] = []
+        if category != "all":
+            conditions.append("tags LIKE ?")
+            params.append(f'%"{category}"%')
+        if availability == "stock":
+            conditions.extend(["off_shelf = 0", "in_stock = 1", "stock_count > 0"])
+        elif availability == "out_of_stock":
+            conditions.extend(["off_shelf = 0", "stock_count = 0"])
+        elif availability == "off_shelf":
+            conditions.append("off_shelf = 1")
+        elif availability == "all":
+            conditions.append("off_shelf = 0")
+        else:
+            raise ValueError("刷新状态无效")
+        where = " AND ".join(conditions)
+        with self.session() as db:
+            total = int(db.execute(
+                f"SELECT COUNT(*) AS total FROM products WHERE {where}", params
+            ).fetchone()["total"])
+            rows = db.execute(
+                f"SELECT * FROM products WHERE {where} "
+                "ORDER BY last_seen ASC, first_seen ASC, goods_key ASC LIMIT ?",
+                [*params, max(1, min(6000, limit))],
+            ).fetchall()
+        return {"total": total, "products": [self._product_row(row) for row in rows]}
 
     def get_visible_products(self, goods_keys: list[str]) -> list[dict[str, Any]]:
         keys = list(dict.fromkeys(goods_keys))
@@ -1970,12 +2055,14 @@ class Database:
             return self._product_row(saved) if saved is not None else None
 
     def mark_source_platform_banned(self, source_token: str, reason: str = "") -> list[dict[str, Any]]:
-        """Archive all active products of a platform-banned shop in its exclusive category."""
+        """Archive active-catalog products of a platform-banned shop."""
         timestamp = now_ts()
         saved_products: list[dict[str, Any]] = []
         with self.session() as db:
             rows = db.execute(
-                "SELECT * FROM products WHERE source_token = ? AND active = 1", (source_token,)
+                f"SELECT * FROM products WHERE source_token = ? AND active = 1 "
+                f"AND {ACTIVE_CATALOG_SQL}",
+                (source_token,),
             ).fetchall()
             if not rows:
                 return saved_products
@@ -1993,8 +2080,11 @@ class Database:
                     platform_banned_reason = ?,
                     out_of_stock_since = CASE WHEN out_of_stock_since = 0 THEN ? ELSE out_of_stock_since END,
                     last_seen = ?, changed_at = CASE WHEN goods_key IN ({keys}) THEN ? ELSE changed_at END
-                WHERE source_token = ? AND active = 1
-                """.format(keys=",".join("?" for _ in changed_keys) if changed_keys else "''"),
+                WHERE source_token = ? AND active = 1 AND {active_catalog}
+                """.format(
+                    keys=",".join("?" for _ in changed_keys) if changed_keys else "''",
+                    active_catalog=ACTIVE_CATALOG_SQL,
+                ),
                 [clean_text(reason, 300), timestamp, timestamp, *changed_keys, timestamp, source_token],
             )
             if changed_keys:
@@ -2002,7 +2092,9 @@ class Database:
             saved_products = [
                 self._product_row(row)
                 for row in db.execute(
-                    "SELECT * FROM products WHERE source_token = ? AND active = 1", (source_token,)
+                    f"SELECT * FROM products WHERE source_token = ? AND active = 1 "
+                    f"AND {ACTIVE_CATALOG_SQL}",
+                    (source_token,),
                 )
             ]
         return saved_products
@@ -2389,18 +2481,29 @@ class Database:
     def stats(self) -> dict[str, Any]:
         category_columns = ",\n                       ".join(
             f"COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND tags LIKE '%\"{item['key']}\"%' THEN 1 ELSE 0 END), 0) AS category_{index}"
-            for index, item in enumerate(CATEGORY_DEFINITIONS)
+            for index, item in enumerate(PRODUCT_CATEGORY_DEFINITIONS)
+        )
+        category_stock_columns = ",\n                       ".join(
+            f"COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND in_stock = 1 AND tags LIKE '%\"{item['key']}\"%' THEN 1 ELSE 0 END), 0) AS category_stock_{index}"
+            for index, item in enumerate(PRODUCT_CATEGORY_DEFINITIONS)
+        )
+        category_off_shelf_columns = ",\n                       ".join(
+            f"COALESCE(SUM(CASE WHEN off_shelf = 1 AND tags LIKE '%\"{item['key']}\"%' THEN 1 ELSE 0 END), 0) AS category_off_shelf_{index}"
+            for index, item in enumerate(PRODUCT_CATEGORY_DEFINITIONS)
         )
         with self.session() as db:
             product = db.execute(
                 f"""
-                SELECT COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 THEN 1 ELSE 0 END), 0) AS total,
-                       COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND in_stock = 1 THEN 1 ELSE 0 END), 0) AS in_stock,
-                       COALESCE(MIN(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND price > 0 THEN price END), 0) AS lowest_price,
+                SELECT COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND {ACTIVE_CATALOG_SQL} THEN 1 ELSE 0 END), 0) AS total,
+                       COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND {ACTIVE_CATALOG_SQL} AND in_stock = 1 THEN 1 ELSE 0 END), 0) AS in_stock,
+                       COALESCE(MIN(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND {ACTIVE_CATALOG_SQL} AND price > 0 THEN price END), 0) AS lowest_price,
                        COALESCE(MAX(last_seen), 0) AS last_scan,
                        COALESCE(SUM(CASE WHEN off_shelf = 1 THEN 1 ELSE 0 END), 0) AS off_shelf_count,
+                       COALESCE(SUM(CASE WHEN off_shelf = 1 AND {ACTIVE_CATALOG_SQL} THEN 1 ELSE 0 END), 0) AS active_catalog_off_shelf,
                        COALESCE(SUM(CASE WHEN platform_banned = 1 THEN 1 ELSE 0 END), 0) AS platform_banned_count,
-                       {category_columns}
+                       {category_columns},
+                       {category_stock_columns},
+                       {category_off_shelf_columns}
                 FROM products WHERE active = 1
                 """
             ).fetchone()
@@ -2416,11 +2519,17 @@ class Database:
                 "enabled_sources": source["enabled"],
                 "category_counts": {
                     item["key"]: product[f"category_{index}"]
-                    for index, item in enumerate(CATEGORY_DEFINITIONS)
-                } | {
-                    OFF_SHELF_CATEGORY["key"]: product["off_shelf_count"],
-                    PLATFORM_BANNED_CATEGORY["key"]: product["platform_banned_count"],
+                    for index, item in enumerate(PRODUCT_CATEGORY_DEFINITIONS)
                 },
+                "category_stock_counts": {
+                    item["key"]: product[f"category_stock_{index}"]
+                    for index, item in enumerate(PRODUCT_CATEGORY_DEFINITIONS)
+                },
+                "category_off_shelf_counts": {
+                    item["key"]: product[f"category_off_shelf_{index}"]
+                    for index, item in enumerate(PRODUCT_CATEGORY_DEFINITIONS)
+                },
+                "active_catalog_off_shelf": product["active_catalog_off_shelf"],
             }
 
 
@@ -3119,6 +3228,7 @@ class ScannerService:
         self._active_source_token = ""
         self._pending_scan_sources: set[str] = set()
         self._browser_factory_leases: dict[str, dict[str, Any]] = {}
+        self._browser_factory_fallbacks: set[str] = set()
         self._browser_factory_lock = threading.Lock()
         self.ai_classifying = False
         self.ai_classification_total = 0
@@ -3324,14 +3434,23 @@ class ScannerService:
                 token: lease for token, lease in self._browser_factory_leases.items()
                 if safe_int(lease.get("expires_at"), 0) > timestamp
             }
+            fallback_tokens = [
+                token for token in self._browser_factory_fallbacks
+                if token != self._active_source_token and token not in self._browser_factory_leases
+            ]
+            fallback_tokens.sort(
+                key=lambda token: safe_int((self.database.get_source(token) or {}).get("last_scan"), 0)
+            )
             current_tokens = [
                 token for token in self._pending_scan_sources
-                if token != self._active_source_token and token not in self._browser_factory_leases
+                if token != self._active_source_token
+                and token not in self._browser_factory_leases
+                and token not in self._browser_factory_fallbacks
             ]
             current_tokens.sort(
                 key=lambda token: safe_int((self.database.get_source(token) or {}).get("last_scan"), 0)
             )
-            tokens = current_tokens[:limit]
+            tokens = (fallback_tokens + current_tokens)[:limit]
             selected = set(tokens)
             if len(tokens) < limit:
                 for source in daily_sources:
@@ -3357,12 +3476,57 @@ class ScannerService:
             "sources": [source for source in sources if source is not None],
         }
 
+    def claim_browser_error_batch(self) -> dict[str, Any]:
+        timestamp = now_ts()
+        lease_id = uuid.uuid4().hex
+        limit = BROWSER_FACTORY_BATCH_SIZE
+        candidates = [
+            source for source in self.database.list_sources(enabled_only=True)
+            if source.get("source_kind") == "shop_api"
+            and source.get("status") in {"error", "paused"}
+        ]
+        candidates.sort(key=lambda source: (safe_int(source.get("last_scan"), 0), str(source["token"])))
+        with self._browser_factory_lock, self._scan_state_lock:
+            self._browser_factory_leases = {
+                token: lease for token, lease in self._browser_factory_leases.items()
+                if safe_int(lease.get("expires_at"), 0) > timestamp
+            }
+            sources = [
+                source for source in candidates
+                if source["token"] != self._active_source_token
+                and source["token"] not in self._browser_factory_leases
+            ][:limit]
+            expires_at = timestamp + BROWSER_FACTORY_LEASE_SECONDS
+            for source in sources:
+                self._browser_factory_leases[str(source["token"])] = {
+                    "lease_id": lease_id,
+                    "expires_at": expires_at,
+                }
+        return {
+            "lease_id": lease_id,
+            "expires_at": expires_at if sources else 0,
+            "lease_seconds": BROWSER_FACTORY_LEASE_SECONDS,
+            "limit": limit,
+            "sources": sources,
+        }
+
     def complete_browser_factory_lease(self, token: str, lease_id: str) -> None:
         with self._browser_factory_lock:
             lease = self._browser_factory_leases.get(token)
             if lease and hmac.compare_digest(str(lease.get("lease_id") or ""), lease_id):
                 self._browser_factory_leases.pop(token, None)
+                self._browser_factory_fallbacks.discard(token)
         self._mark_source_idle(token, completed=True)
+
+    def release_browser_factory_lease(self, token: str, lease_id: str) -> None:
+        with self._browser_factory_lock:
+            lease = self._browser_factory_leases.get(token)
+            if lease and hmac.compare_digest(str(lease.get("lease_id") or ""), lease_id):
+                self._browser_factory_leases.pop(token, None)
+
+    def _queue_browser_factory_fallback(self, token: str) -> None:
+        with self._browser_factory_lock:
+            self._browser_factory_fallbacks.add(token)
 
     def _browser_factory_leased(self, token: str) -> bool:
         timestamp = now_ts()
@@ -3601,8 +3765,8 @@ class ScannerService:
         existing = self.database.get_product(goods_key)
         if existing is None:
             raise KeyError(goods_key)
-        if existing.get("off_shelf"):
-            raise ValueError("已下架商品不参与刷新")
+        if not is_active_catalog_tags(existing.get("tags") or []):
+            raise ValueError("该商品不在当前启用分类中")
         source_token = str(existing["source_token"])
         if self.is_server_refreshing_source(source_token):
             raise ProductRefreshInProgress(goods_key)
@@ -3671,11 +3835,13 @@ class ScannerService:
 
         try:
             clean_source_name = clean_text(source_name or source.get("name") or token, 200)
+            cold_keys = self.database.cold_product_keys(token)
             existing_keys = {
                 str(product["goods_key"])
                 for product in self.database.list_source_products(token)
+                if str(product["goods_key"]) not in cold_keys
             }
-            seen: set[str] = set()
+            seen: set[str] = set(cold_keys)
             matched = 0
             changed = 0
             for item in items:
@@ -3686,8 +3852,10 @@ class ScannerService:
                 )
                 if product is None:
                     continue
-                matched += 1
                 seen.add(product["goods_key"])
+                if product["goods_key"] in cold_keys or not is_active_catalog_tags(product["tags"]):
+                    continue
+                matched += 1
                 change, saved = self.database.upsert_product(product)
                 if change != "unchanged":
                     changed += 1
@@ -3747,7 +3915,11 @@ class ScannerService:
             valid_requested: set[str] = set()
             for goods_key in requested_keys:
                 existing = self.database.get_product(goods_key)
-                if existing is not None and str(existing.get("source_token")) == token:
+                if (
+                    existing is not None
+                    and str(existing.get("source_token")) == token
+                    and is_active_catalog_tags(existing.get("tags") or [])
+                ):
                     valid_requested.add(goods_key)
             if not valid_requested:
                 raise ValueError("当前筛选中没有属于该采集源的有效商品")
@@ -3801,6 +3973,75 @@ class ScannerService:
             source_lock.release()
             self._local_ingest_lock.release()
             self._local_ingest_idle.set()
+
+    def ingest_local_product_validations(self, results: list[dict[str, Any]]) -> dict[str, Any]:
+        verified = out_of_stock = off_shelf = platform_banned = changed = 0
+        banned_sources: set[str] = set()
+        unavailable_keys: set[str] = set()
+        for result in results[:24]:
+            if not isinstance(result, dict):
+                continue
+            goods_key = clean_text(result.get("goods_key"), 200)
+            existing = self.database.get_product(goods_key)
+            if (
+                existing is None
+                or existing.get("off_shelf")
+                or existing.get("platform_banned")
+                or not is_active_catalog_tags(existing.get("tags") or [])
+            ):
+                continue
+            source_token = str(existing["source_token"])
+            status = str(result.get("status") or "")
+            error = clean_text(result.get("error"), 500)
+            if status == "platform_banned":
+                if source_token in banned_sources:
+                    continue
+                archived = self.database.mark_source_platform_banned(source_token, error or "本地详情核验：商家关闭")
+                self.database.update_source_scan(
+                    source_token, status="banned", error=error or "本地详情核验：商家关闭",
+                    count=len(archived), scanned=True,
+                )
+                banned_sources.add(source_token)
+                unavailable_keys.update(str(product["goods_key"]) for product in archived)
+                platform_banned += len(archived)
+                changed += len(archived)
+                continue
+            if status == "off_shelf":
+                saved = self.database.mark_product_off_shelf(goods_key, error or "本地详情核验：不可购买")
+                if saved is not None:
+                    unavailable_keys.add(goods_key)
+                    off_shelf += 1
+                    changed += 1
+                    self.events.publish("product", {"change": "off_shelf", "product": saved})
+                continue
+            item = result.get("item")
+            source = self.database.get_source(source_token)
+            if status != "ok" or not isinstance(item, dict) or source is None:
+                continue
+            product = product_from_api(
+                item,
+                source_token,
+                str(existing.get("source_name") or source.get("name") or source_token),
+                str(source.get("base_url") or LDXP_BASE_URL),
+            )
+            if product is None or product["goods_key"] != goods_key:
+                continue
+            change, saved = self.database.upsert_product(product)
+            verified += 1
+            if not saved.get("in_stock"):
+                out_of_stock += 1
+                unavailable_keys.add(goods_key)
+            if change != "unchanged":
+                changed += 1
+            self.events.publish("product", {"change": change, "product": saved})
+        return {
+            "verified": verified,
+            "out_of_stock": out_of_stock,
+            "off_shelf": off_shelf,
+            "platform_banned": platform_banned,
+            "changed": changed,
+            "unavailable_keys": sorted(unavailable_keys),
+        }
 
     @staticmethod
     def _priceai_snapshot_url(latest: Any) -> str:
@@ -4400,13 +4641,16 @@ class ScannerService:
         result = ScanResult()
         proxy_only = reason == "manual_proxy_only"
         try:
-            if reason in {"manual", "manual_proxy_only"}:
-                # Make an accepted full scan immediately joinable, including while
-                # source discovery is still running before the first source starts.
+            if reason in {"manual", "manual_proxy_only", "manual_pending"}:
+                # Publish the accepted queue immediately so browser workers can
+                # lease sources before the server starts its first request.
                 self._set_pending_scan_sources(
-                    self.database.list_sources_due_for_scan(scheduled=False)
+                    self.database.list_sources_due_for_scan(
+                        scheduled=reason == "manual_pending",
+                        in_stock_only=reason == "manual_pending",
+                    )
                 )
-            if not proxy_only:
+            if not proxy_only and reason != "manual_pending":
                 try:
                     self._discover_sources(force=reason in {"startup", "discovery"})
                 except Exception as exc:
@@ -4416,7 +4660,8 @@ class ScannerService:
                         {"phase": "error", "error": str(exc) or exc.__class__.__name__},
                     )
             sources = self.database.list_sources_due_for_scan(
-                scheduled=reason in {"scheduled", "manual_pending"}
+                scheduled=reason in {"scheduled", "manual_pending"},
+                in_stock_only=reason == "manual_pending",
             )
             result.source_count = len(sources)
             self._set_pending_scan_sources(sources)
@@ -4451,6 +4696,8 @@ class ScannerService:
                     except Exception as exc:  # one bad shop must not stop the full sweep
                         result.failed += 1
                         message = str(exc) or exc.__class__.__name__
+                        if is_access_error(exc):
+                            self._queue_browser_factory_fallback(token)
                         self.database.update_source_scan(
                             token, status="error", error=message, count=0, scanned=True
                         )
@@ -4530,6 +4777,8 @@ class ScannerService:
         for existing in products:
             if self._stop.is_set():
                 break
+            if not is_active_catalog_tags(existing.get("tags") or []):
+                continue
             checked += 1
             goods_key = str(existing["goods_key"])
             previously_off_shelf = bool(existing.get("off_shelf"))
@@ -4602,14 +4851,16 @@ class ScannerService:
         checkpoint = self.database.get_or_create_scan_checkpoint(token)
         client = client or LDXPClient(base_url=base_url)
         info = client.shop_info(remote_token)
+        validation_required = bool(source.get("validation_required"))
         source_name = str(info.get("nickname") or remote_token)
         self.database.update_source_scan(token, status="scanning", name=source_name)
         changed_count = 0
         cycle_id = str(checkpoint["cycle_id"])
         off_shelf_keys = self.database.off_shelf_product_keys(token)
+        cold_keys = self.database.cold_product_keys(token)
         # Keep archived listings out of this scan without allowing checkpoint cleanup
         # to deactivate them. A user can still explicitly refresh one if it is relisted.
-        for goods_key in off_shelf_keys:
+        for goods_key in off_shelf_keys | cold_keys:
             self.database.mark_scan_seen(token, cycle_id, goods_key)
 
         available_types = [
@@ -4649,12 +4900,22 @@ class ScannerService:
                 total = safe_int(payload.get("total"), len(items))
                 for item in items:
                     item_key = str(item.get("goods_key") or "")
-                    if item_key in off_shelf_keys:
+                    if item_key in off_shelf_keys or item_key in cold_keys:
                         continue
+                    if validation_required and item_key:
+                        detail = client.goods_info(item_key)
+                        item = {
+                            **item,
+                            **detail,
+                            "category": detail.get("category") or item.get("category"),
+                            "goods_type": detail.get("goods_type") or item.get("goods_type"),
+                        }
                     product = product_from_api(item, token, source_name, base_url)
                     if product is None:
                         continue
                     self.database.mark_scan_seen(token, cycle_id, product["goods_key"])
+                    if not is_active_catalog_tags(product["tags"]):
+                        continue
                     change, saved = self.database.upsert_product(product)
                     if change != "unchanged":
                         changed_count += 1
@@ -4691,11 +4952,18 @@ class ScannerService:
                     time.sleep(LDXP_PAGE_DELAY)
 
         entry_goods_key = str(source.get("entry_goods_key") or "").strip()
-        if entry_goods_key and not self.database.scan_seen_contains(token, cycle_id, entry_goods_key):
+        if (
+            entry_goods_key
+            and entry_goods_key not in cold_keys
+            and not self.database.scan_seen_contains(token, cycle_id, entry_goods_key)
+        ):
             item = client.goods_info(entry_goods_key)
             product = product_from_api(item, token, source_name, base_url)
             if product is not None:
                 self.database.mark_scan_seen(token, cycle_id, product["goods_key"])
+                if not is_active_catalog_tags(product["tags"]):
+                    product = None
+            if product is not None:
                 change, saved = self.database.upsert_product(product)
                 if change != "unchanged":
                     changed_count += 1
@@ -4731,6 +4999,11 @@ class AppState:
         self.events = events
         self.scanner = scanner
         self._user_refresh_claim_lock = threading.Lock()
+        self._server_refresh_lock = threading.Lock()
+        self._server_refresh_status: dict[str, Any] = {
+            "running": False, "total": 0, "completed": 0, "failed": 0, "error": "",
+        }
+        self._manual_refresh_claims: dict[str, set[str]] = {}
 
     def claim_user_refresh_batch(
         self, payload: dict[str, Any], *, allow_lazy_refresh: bool = False
@@ -4740,8 +5013,33 @@ class AppState:
         valid_categories = {"all", *(item["key"] for item in PRODUCT_CATEGORY_DEFINITIONS)}
         if category not in valid_categories:
             raise ValueError("分类无效")
+        availability = clean_text(payload.get("availability") or "", 30)
+        if availability:
+            if availability not in {"stock", "out_of_stock", "off_shelf", "all"}:
+                raise ValueError("刷新状态无效")
+            limit = max(1, min(50, safe_int(payload.get("limit"), 50)))
+            cycle_id = clean_text(payload.get("cycle_id") or "", 80)
+            if not re.fullmatch(r"[0-9a-zA-Z-]{8,80}", cycle_id):
+                raise ValueError("刷新轮次无效")
+            with self._user_refresh_claim_lock:
+                page = self.database.list_refresh_candidates(
+                    category=category, availability=availability, limit=6000
+                )
+                if cycle_id not in self._manual_refresh_claims and len(self._manual_refresh_claims) >= 64:
+                    self._manual_refresh_claims.pop(next(iter(self._manual_refresh_claims)))
+                claimed = self._manual_refresh_claims.setdefault(cycle_id, set())
+                products = [
+                    product for product in page["products"]
+                    if str(product["goods_key"]) not in claimed
+                ][:limit]
+                claimed.update(str(product["goods_key"]) for product in products)
+            return {
+                "products": products, "total": page["total"], "offset": len(claimed) - len(products),
+                "next_offset": len(claimed), "limit": limit,
+                "scope": f"{category}:{availability}", "cycle_id": cycle_id,
+            }
         sort = clean_text(payload.get("sort") or "price", 20)
-        if sort not in {"price", "stock", "updated"}:
+        if sort not in {"price", "stock", "updated", "updated_asc"}:
             sort = "price"
         scope = {
             "category": category,
@@ -4792,6 +5090,36 @@ class AppState:
             "limit": 24,
             "scope": scope_key,
         }
+
+    def start_server_refresh_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._server_refresh_lock.acquire(blocking=False):
+            return {"started": False, **self.server_refresh_status()}
+        batch = self.claim_user_refresh_batch(payload)
+        products = batch["products"]
+        self._server_refresh_status = {
+            "running": True, "total": len(products), "completed": 0, "failed": 0,
+            "error": "", "scope": batch["scope"],
+        }
+
+        def run() -> None:
+            try:
+                for product in products:
+                    try:
+                        self.scanner.refresh_product(str(product["goods_key"]))
+                    except Exception as exc:
+                        self._server_refresh_status["failed"] += 1
+                        self._server_refresh_status["error"] = clean_text(exc, 300)
+                    finally:
+                        self._server_refresh_status["completed"] += 1
+            finally:
+                self._server_refresh_status["running"] = False
+                self._server_refresh_lock.release()
+
+        threading.Thread(target=run, name="server-product-refresh-batch", daemon=True).start()
+        return {"started": True, **self.server_refresh_status()}
+
+    def server_refresh_status(self) -> dict[str, Any]:
+        return dict(self._server_refresh_status)
 
     def snapshot(self, include_products: bool = False) -> dict[str, Any]:
         payload = {
@@ -4962,6 +5290,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, **self.app.snapshot(include_products=False)})
         elif path == "/api/state":
             self._send_json({"ok": True, **self.app.snapshot(include_products=False)})
+        elif path == "/api/category-refresh/server-status":
+            self._send_json({"ok": True, **self.app.server_refresh_status()})
         elif path == "/api/products/stream":
             self._serve_product_stream(parsed.query)
         elif path == "/api/products/visible":
@@ -5398,10 +5728,28 @@ class RequestHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        if path == "/api/category-refresh/server":
+            try:
+                result = self.app.start_server_refresh_batch(self._read_json())
+                self._send_json({"ok": True, **result}, HTTPStatus.ACCEPTED)
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if path == "/api/browser-factory/claim":
             payload = self._read_json()
             batch = self.app.scanner.claim_browser_factory_batch(payload.get("multiplier", 1))
             self._send_json({"ok": True, **batch})
+            return
+        if path == "/api/browser-factory/claim-errors":
+            batch = self.app.scanner.claim_browser_error_batch()
+            self._send_json({"ok": True, **batch})
+            return
+        if path == "/api/browser-factory/release":
+            payload = self._read_json()
+            token = normalize_source(str(payload.get("token") or ""))
+            lease_id = str(payload.get("lease_id") or "")
+            self.app.scanner.release_browser_factory_lease(token, lease_id)
+            self._send_json({"ok": True})
             return
         if path == "/api/local-scan/source":
             try:
@@ -5429,6 +5777,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.NOT_FOUND, "采集源不存在")
             except LocalScanBusy:
                 self._error(HTTPStatus.CONFLICT, "服务器正在处理其他扫描")
+            return
+        if path == "/api/local-validation/products":
+            try:
+                payload = self._read_json(max_bytes=2 * 1024 * 1024)
+                results = payload.get("results")
+                if not isinstance(results, list) or len(results) > 24:
+                    raise ValueError("本地商品核验结果格式不正确")
+                summary = self.app.scanner.ingest_local_product_validations(results)
+                self._send_json({"ok": True, **summary})
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/local-scan/products":
             try:
@@ -5634,7 +5993,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         sort = query_value("sort", "price")
-        if sort not in {"price", "stock", "updated"}:
+        if sort not in {"price", "stock", "updated", "updated_asc"}:
             self._error(HTTPStatus.BAD_REQUEST, "商品排序无效")
             return
 
