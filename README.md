@@ -3,6 +3,15 @@
 面向公开店铺的商品比价与库存观察工具。服务端按计划采集公开商品信息，网页通过流式更新展示价格、分类、库存和评价聚合结果。
 
 > 仅供学习和公开数据整理使用。请遵守目标站点条款、控制访问频率，并自行承担部署和使用责任。
+> 请注意ip池的消耗，站点因ip池消耗较快出错，扫号站点由网友3920498253推荐：
+> https://ldxp.qizhang.org/
+> https://priceai.cc/channels
+> https://aiprobe.top/
+> https://cardnav.xyz/
+> 测试发现收录商品可用度较高，此站台ip池问题刷新不及时，所以关闭了，代码和收集的店铺链接保留，需要部署的请自行部署，
+> 描述中的网站ip已更换并跑路，感谢理解，
+> <img width="1280" height="1280" alt="C6687211631A5EF7A67B0697D277AE20" src="https://github.com/user-attachments/assets/1800c0b6-ed90-4ffd-a5c2-264d32705c80" />
+
 
 ## 界面预览
 
