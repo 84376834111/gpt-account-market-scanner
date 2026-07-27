@@ -1,56 +1,83 @@
 # LDXP 扫货台
 
-一个面向 `pay.ldxp.cn` 和 `catfk.com` 公开店铺的轻量比价看板。服务端定时采集商品名称、价格和库存，按关键词分类，并通过 SSE 将结果逐条推送到网页，扫描期间不会阻塞页面。
+面向公开店铺的商品比价与库存观察工具。服务端按计划采集公开商品信息，网页通过流式更新展示价格、分类、库存和评价聚合结果。
+
+> 仅供学习和公开数据整理使用。请遵守目标站点条款、控制访问频率，并自行承担部署和使用责任。
 
 ## 界面预览
 
 ![LDXP 扫货台界面预览](docs/images/dashboard.png)
 
-## 功能
+## 已实现功能
 
-- 内置 Plus、GPT Free/非 Plus、Team、Pro、K12、Cursor、Codex、Claude、Kiro、Gemini、邮箱、接码等关键词；Plus 与非 Plus 账号会进一步按已接码、未接码拆分。
-- 支持在网页中添加公开店铺链接；`catfk.com` 商品链接也可直接粘贴，程序会反查所属店铺。启用、停用和删除采集源仅限管理员令牌已验证的用户。
-- 内置 17 个已验证公开店铺，并定期从爱比价公开社区自动发现新链接。
-- SQLite 持久化商品、价格和库存变化。
-- 浏览器可用当前设备网络执行全量扫描、仅刷新当前筛选结果或刷新单件商品，并把结果回传服务器。
-- 服务器手动扫描和自动调度只允许在服务器后台控制，网页不暴露主动扫描、暂停或开启自动扫描入口。
-- 手机和桌面端自适应，无前端或 Python 第三方依赖。
+- 聚合商品名称、公开购买链接、价格、市场参考价、分类和库存状态。
+- 支持 Plus、Team、BugTeam、Codex、Claude、Gemini、Cursor、Kiro、邮箱、接码和中转站等分类。
+- 中转站分类使用独立规则，排除邮箱/OAuth、短信接口、账号、教程脚本、订阅，以及仅在描述中提到中转用途的账号商品。
+- 支持按关键词、分类、价格、库存、更新时间和评分筛选排序。
+- 保存价格与库存历史节点，可按小时、天、周查看走势。
+- 商品评论支持聚合评分；公开数据只输出评论数量和聚合分，不输出评论者身份、正文或图片。
+- 已下架商品不进入常规扫描。新缺货商品约每 2 小时复查，连续缺货满 24 小时后进入每日一次的极懒更新。
+- 每个来源记录最近扫描时间，调度时跳过已完成或仍在租约中的来源，减少重复请求。
+
+## 浏览器刷新工厂
+
+网页可领取 `24 × 倍率` 个刷新任务，倍率范围为 1 到 5，单次最多 120 个：
+
+- 优先领取服务器当前待执行队列，没有待执行任务时再领取日常到期任务。
+- 任务按来源逐个执行，按钮旁实时显示完成数、失败数和当前状态。
+- 浏览器和服务器共享来源级租约，避免同时执行同一来源。
+- 租约默认 10 分钟；浏览器未及时回传时，任务自动归还服务器继续处理。
+- 请勿频繁领取，避免触发目标平台访问限制。
+
+服务器全量更新按钮目前暂时停用；单商品刷新、浏览器任务领取和后台计划任务不受影响。
+
+## 公开数据快照
+
+仓库包含由服务器数据库生成的脱敏快照：
+
+- `docs/data/catalog-summary.json`：商品数量、库存和分类汇总。
+- `docs/data/catalog-snapshot.jsonl.gz`：每行一个 JSON 商品记录的 gzip 文件。
+
+商品记录包含名称、公开购买链接、分类、价格、库存、最后更新时间、评论数、实际平均分和加权分。快照不包含服务器地址、登录凭据、内部来源令牌、评论者身份、评论正文或评论图片。
+
+重新导出：
+
+```powershell
+python .\tools\export_public_catalog_snapshot.py .\data\ldxp.db .\docs\data
+```
 
 ## 本地运行
+
+项目只使用 Python 标准库：
 
 ```powershell
 $env:LDXP_SCAN_INTERVAL = "900"
 python .\app.py
 ```
 
-打开 `http://127.0.0.1:8765/`。服务端主动扫描与调度接口必须携带后台密钥；未配置密钥时这些接口一律拒绝访问。
+打开 `http://127.0.0.1:8765/`。管理接口必须携带 `LDXP_ADMIN_KEY`；没有配置密钥时会拒绝管理操作。
 
-如需自定义配置，可复制 `.env.example` 中的变量到进程管理器或私有环境文件。程序不会自动读取 `.env`；该文件仅作为配置清单示例。
+常用环境变量见 [.env.example](.env.example)，包括监听地址、数据库路径、扫描间隔、请求超时和可选备用代理。不要把生产环境的域名、IP、密钥、数据库或代理订阅提交到仓库。
 
-可用环境变量：
+## Ubuntu 部署
 
-- `LDXP_HOST`：监听地址，默认 `127.0.0.1`
-- `LDXP_PORT`：监听端口，默认 `8765`
-- `LDXP_DB_PATH`：SQLite 路径，默认 `data/ldxp.db`
-- `LDXP_AUTO_SCAN_ENABLED`：是否在启动后定时自动扫描，默认 `true`
-- `LDXP_SCAN_INTERVAL`：自动扫描间隔秒数，默认 `900`（15 分钟）
-- `LDXP_SOURCE_INTERVAL`：流式扫描中两个店铺的最小启动间隔，默认 `15` 秒
-- `LDXP_DISCOVERY_INTERVAL`：自动发现公开店铺链接的间隔秒数，默认 `21600`（6 小时）
-- `LDXP_DISCOVERY_URL`：公开源发现接口，默认使用爱比价社区帖子接口
-- `LDXP_PAGE_SIZE`：每次分页请求的商品数，默认 `300`
-- `LDXP_MAX_PAGES`：每个店铺商品类型的最大页数，默认 `20`
-- `LDXP_PAGE_DELAY`：同一商品类型两页之间的等待秒数，默认 `0.05`
-- `LDXP_REQUEST_TIMEOUT`：单次 LDXP 请求超时秒数，默认 `20`
-- `CATFK_BASE_URL`：云猫寄售公开站点地址，默认 `https://catfk.com`
-- `LDXP_FAILOVER_PROXY_URL`：可选 HTTP 备用代理；直连失败后才使用
-- `LDXP_DIRECT_ATTEMPTS`：直连尝试次数，默认 `1`
-- `LDXP_PROXY_ATTEMPTS`：备用代理尝试次数，默认 `3`
-- `LDXP_RETRY_DELAY`：重试间隔秒数，默认 `0.4`
-- `LDXP_ADMIN_KEY`：服务器管理密钥，用于后台扫描控制及采集源的启用、停用、删除；部署脚本会自动生成且不会输出密钥
+全新 Ubuntu/Debian 主机可使用部署脚本：
 
-## 服务器后台扫描命令
+```bash
+curl -fsSL https://raw.githubusercontent.com/<account>/<repository>/main/deploy/bootstrap.sh | \
+  sudo env LDXP_REPOSITORY=https://github.com/<account>/<repository>.git bash
+```
 
-部署后通过 SSH 使用以下命令，网页端没有这些控制入口：
+安装脚本默认只监听 `127.0.0.1:8765`。如需接入已有 Nginx，显式传入站点配置路径和公开地址：
+
+```bash
+sudo env \
+  LDXP_NGINX_SITE=/etc/nginx/sites-available/example.com \
+  LDXP_PUBLIC_URL=https://example.com/ldxp/ \
+  bash deploy/install.sh
+```
+
+## 后台扫描命令
 
 ```bash
 sudo ldxp-scanctl status
@@ -61,77 +88,17 @@ sudo ldxp-scanctl scan
 sudo ldxp-scanctl discover
 ```
 
-## 数据源说明
-
-LDXP 的公开首页没有全站商品目录。每个公开店铺由 `/shop/{token}` 链接承载，因此无法通过 LDXP 接口证明已枚举所有私下店铺。程序首次运行会加入已验证的公开店铺，并从爱比价公开社区的帖子、回复和商品链接持续发现新源；未在公开网页出现的店铺仍需手动添加。
-
 ## 测试
 
 ```powershell
 python -m unittest discover -s tests -v
+node --check static/app.js
 ```
 
-## Ubuntu 一键部署
+## 数据来源与边界
 
-适用于全新的 Ubuntu/Debian 主机。脚本会安装 `git`、`python3` 和证书包，将源码检出到 `/opt/ldxp-scanner-source`，再创建并启动 `ldxp-scanner` 专用服务账户。默认只监听 `127.0.0.1:8765`，不会自动公开端口。
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/<account>/<repository>/main/deploy/bootstrap.sh | \
-  sudo env LDXP_REPOSITORY=https://github.com/<account>/<repository>.git bash
-```
-
-如需接入已有 Nginx 站点，明确传入该机器的站点配置路径和公开地址：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/<account>/<repository>/main/deploy/bootstrap.sh | \
-  sudo env \
-    LDXP_REPOSITORY=https://github.com/<account>/<repository>.git \
-    LDXP_NGINX_SITE=/etc/nginx/sites-available/example.com \
-    LDXP_PUBLIC_URL=https://example.com/ldxp/ \
-    bash
-```
-
-可通过 `LDXP_REPOSITORY`、`LDXP_REF` 和 `LDXP_SOURCE_DIR` 覆盖源码仓库、分支和检出目录。更新时脚本只会更新来源一致且没有本地改动的检出目录。
-
-## 手动 Ubuntu 部署
-
-systemd 与 Nginx 部署文件位于 `deploy/`。安装脚本默认只启动本机 `127.0.0.1:8765` 服务；如需把 `/ldxp/` 注入已有 Nginx 站点，显式传入该机器上的私有配置路径：
-
-```bash
-sudo env \
-  LDXP_NGINX_SITE=/etc/nginx/sites-available/example.com \
-  LDXP_PUBLIC_URL=https://example.com/ldxp/ \
-  bash deploy/install.sh
-```
-
-`LDXP_NGINX_SITE` 和 `LDXP_PUBLIC_URL` 不设置时，安装脚本不会读取或修改 Nginx。生产环境的域名、IP、数据库、`/etc/ldxp-scanner.env`、代理订阅地址和采集结果都属于机器私有数据，不应提交到源码仓库。
-
-## 使用边界
-
-本项目只处理公开页面和公开接口中的商品信息。部署者需要自行确认数据源条款、访问频率和当地法律要求，并为自己的使用方式负责。
+程序只处理公开页面和公开接口中的商品信息。公开首页通常不提供完整店铺目录，因此无法证明已覆盖所有私有或未公开来源。部署者应确认数据源条款、访问频率和当地法律要求。
 
 ## 许可证
 
-本项目使用 [MIT License](LICENSE)。
-
-## 商铺链接清单
-
-当前采集到的公开商铺链接位于 [docs/shop-links.txt](docs/shop-links.txt)，共 681 条，供检索、去重或补充采集源时参考。
-
-## 推荐中转站
-
-以下为作者当前的个人使用反馈：两家均为服务商自行搓号的一手号来源，日常使用稳定。它们均为第三方服务，请在使用前自行评估服务条款、账号安全和可用性。
-
-### [ai.hyperai.icu](https://ai.hyperai.icu)
-
-- 推荐分组：低价 GPT 混池
-- 当前倍率：`0.1x`
-
-![ai.hyperai.icu 低价 GPT 混池倍率](docs/images/hyperai-pricing.png)
-
-### [api.zyzy111.xyz](https://api.zyzy111.xyz)
-
-- 推荐分组：混池 `0.1x`
-- 当前倍率：`0.1x`
-
-![api.zyzy111.xyz 混池倍率](docs/images/zyzy-pricing.png)
+[MIT License](LICENSE)

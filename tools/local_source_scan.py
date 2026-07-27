@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
 import sys
 import threading
@@ -22,12 +23,19 @@ def fetch_state(base_url: str) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
-def scan_source(source: dict[str, Any]) -> dict[str, Any]:
+def scan_source(source: dict[str, Any], proxy: str = "", source_delay: float = 0.0) -> dict[str, Any]:
     token = str(source["token"])
     base_url = str(source.get("base_url") or LDXP_BASE_URL).rstrip("/")
     remote_token = str(source.get("remote_token") or token)
     try:
+        if source_delay > 0:
+            time.sleep(source_delay)
         client = LDXPClient(base_url=base_url)
+        if proxy:
+            client.direct_opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+            )
         info = client.shop_info(remote_token)
         source_name = str(info.get("nickname") or source.get("name") or remote_token)
         available_types = [
@@ -99,15 +107,36 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--all-enabled", action="store_true")
     parser.add_argument("--tokens", nargs="*")
+    parser.add_argument("--manifest", type=Path, help="server-exported source manifest JSON")
+    parser.add_argument("--retry-report", type=Path, help="only scan tokens that failed in a prior report")
+    parser.add_argument("--proxy", default="", help="local HTTP(S) proxy, e.g. http://127.0.0.1:7890")
+    parser.add_argument("--source-delay", type=float, default=0.0, help="delay before each source request")
     args = parser.parse_args()
 
-    state = fetch_state(args.base_url)
-    sources = [source for source in state.get("sources") or [] if source.get("enabled")]
+    if args.manifest:
+        payload = json.loads(args.manifest.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("manifest must contain a JSON list of sources")
+        sources = [source for source in payload if isinstance(source, dict) and source.get("enabled")]
+    else:
+        state = fetch_state(args.base_url)
+        sources = [source for source in state.get("sources") or [] if source.get("enabled")]
+    sources = [source for source in sources if source.get("source_kind", "shop_api") == "shop_api"]
+    if args.retry_report:
+        prior = json.loads(args.retry_report.read_text(encoding="utf-8"))
+        failed_tokens = {
+            str(item.get("token"))
+            for item in prior.get("sources") or []
+            if isinstance(item, dict) and not item.get("complete") and item.get("token")
+        }
+        sources = [source for source in sources if str(source.get("token")) in failed_tokens]
     if args.tokens:
         requested_tokens = set(args.tokens)
         sources = [source for source in sources if source["token"] in requested_tokens]
-    elif not args.all_enabled:
-        sources = [source for source in sources if source.get("status") != "ok"]
+    elif not args.manifest and not args.all_enabled:
+        # A source currently owned by the server scanner must not be duplicated
+        # by a helper node. Only completed failures are eligible for rescue.
+        sources = [source for source in sources if source.get("status") == "error"]
 
     report: dict[str, Any] = {
         "created_at": int(time.time()),
@@ -117,7 +146,10 @@ def main() -> None:
     }
     lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {pool.submit(scan_source, source): source for source in sources}
+        futures = {
+            pool.submit(scan_source, source, args.proxy, args.source_delay): source
+            for source in sources
+        }
         for index, future in enumerate(as_completed(futures), start=1):
             result = future.result()
             report["sources"].append(result)

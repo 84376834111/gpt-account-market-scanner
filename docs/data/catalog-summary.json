@@ -1,0 +1,35 @@
+{
+  "generated_at": 1785134498,
+  "products": 15557,
+  "inventory": {
+    "out_of_stock": 3918,
+    "in_stock": 11516,
+    "unknown": 123
+  },
+  "categories": {
+    "bugteam": 79,
+    "claude": 1359,
+    "codex": 2231,
+    "cursor": 150,
+    "free": 781,
+    "free_no_sms": 98,
+    "free_sms": 254,
+    "gemini": 2324,
+    "k12": 608,
+    "kiro": 141,
+    "mail": 4250,
+    "plus": 4756,
+    "plus_no_sms": 882,
+    "plus_sms": 526,
+    "pro": 1827,
+    "relay": 274,
+    "sms": 1969,
+    "team": 240
+  },
+  "reviews": {
+    "products_with_reviews": 0,
+    "review_count": 0
+  },
+  "snapshot": "catalog-snapshot.jsonl.gz",
+  "privacy": "No server address, credentials, internal source tokens, reviewer identity, review body, or image data."
+}

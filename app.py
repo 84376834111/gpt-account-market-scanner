@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import html
+import base64
+import binascii
+import gzip
 import http.cookiejar
 import hmac
+import hashlib
 import ipaddress
 import json
 import math
@@ -11,6 +15,7 @@ import os
 import queue
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -29,10 +34,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from relay_rules import relay_classification_reason
+
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 DB_PATH = Path(os.getenv("LDXP_DB_PATH", str(ROOT / "data" / "ldxp.db")))
+COMMENT_IMAGE_DIR = Path(
+    os.getenv("LDXP_COMMENT_IMAGE_DIR", str(DB_PATH.parent / "comment-images"))
+)
 HOST = os.getenv("LDXP_HOST", "127.0.0.1")
 PORT = int(os.getenv("LDXP_PORT", "8765"))
 SCAN_INTERVAL = max(30, int(os.getenv("LDXP_SCAN_INTERVAL", "900")))
@@ -52,6 +62,9 @@ LDXP_PAGE_SIZE = max(1, min(1000, int(os.getenv("LDXP_PAGE_SIZE", "300"))))
 LDXP_MAX_PAGES = max(1, int(os.getenv("LDXP_MAX_PAGES", "20")))
 LDXP_PAGE_DELAY = max(0.0, float(os.getenv("LDXP_PAGE_DELAY", "0.05")))
 LDXP_REQUEST_TIMEOUT = max(1, int(os.getenv("LDXP_REQUEST_TIMEOUT", "20")))
+LDXP_LINK_CHECK_BODY_LIMIT = max(
+    1024, min(262144, int(os.getenv("LDXP_LINK_CHECK_BODY_LIMIT", "65536")))
+)
 LDXP_FAILOVER_PROXY_URL = os.getenv("LDXP_FAILOVER_PROXY_URL", "").strip()
 LDXP_DIRECT_ATTEMPTS = max(1, int(os.getenv("LDXP_DIRECT_ATTEMPTS", "1")))
 LDXP_PROXY_ATTEMPTS = max(0, int(os.getenv("LDXP_PROXY_ATTEMPTS", "3")))
@@ -102,16 +115,24 @@ LDXP_AI_CLASSIFIER_DELAY = max(
 AI_CLASSIFICATION_ENABLED = False
 PRODUCT_STREAM_DEFAULT_LIMIT = 12
 PRODUCT_STREAM_MAX_LIMIT = 500
+BROWSER_FACTORY_BATCH_SIZE = 24
+BROWSER_FACTORY_LEASE_SECONDS = 10 * 60
+COMMENT_PREVIEW_LIMIT = 10
+COMMENT_MAX_IMAGES = 5
+COMMENT_IMAGE_MAX_BYTES = 900 * 1024
+COMMENT_AVATAR_MAX_BYTES = 100 * 1024
 UNKNOWN_OR_ZERO_REFRESH_INTERVAL = 6 * 60 * 60
 LOW_STOCK_REFRESH_INTERVAL = 20 * 60
 NORMAL_STOCK_REFRESH_INTERVAL = 45 * 60
 HIGH_STOCK_REFRESH_INTERVAL = 90 * 60
 OUT_OF_STOCK_REFRESH_INTERVALS = (
-    (24 * 60 * 60, 4 * 60 * 60),
-    (3 * 24 * 60 * 60, 6 * 60 * 60),
-    (7 * 24 * 60 * 60, 12 * 60 * 60),
+    (24 * 60 * 60, 2 * 60 * 60),
     (float("inf"), 24 * 60 * 60),
 )
+# A newly confirmed shortage is checked every two hours. After a full day it
+# leaves the ordinary visitor-triggered lane and enters the daily ultra-lazy lane.
+LAZY_OUT_OF_STOCK_AFTER = 24 * 60 * 60
+LAZY_REFRESH_INTERVAL = 24 * 60 * 60
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 
@@ -135,6 +156,7 @@ CATEGORY_DEFINITIONS = [
     {"key": "claude", "label": "Claude", "terms": ["claude", "克劳德"]},
     {"key": "kiro", "label": "Kiro", "terms": ["kiro"]},
     {"key": "gemini", "label": "Gemini", "terms": ["gemini", "谷歌ai"]},
+    {"key": "relay", "label": "中转站", "terms": []},
     {
         "key": "mail",
         "label": "邮箱",
@@ -149,6 +171,9 @@ CATEGORY_DEFINITIONS = [
         "terms": ["gpt接码", "codex接码", "接码服务", "长效接码", "接验证码", "短信接收", "sms", "手机号验证"],
     },
 ]
+OFF_SHELF_CATEGORY = {"key": "off_shelf", "label": "已下架"}
+PLATFORM_BANNED_CATEGORY = {"key": "platform_banned", "label": "已被平台封禁"}
+PRODUCT_CATEGORY_DEFINITIONS = [*CATEGORY_DEFINITIONS, OFF_SHELF_CATEGORY, PLATFORM_BANNED_CATEGORY]
 
 # Additional title terms and exclusions distilled from the current catalog.  The
 # base definitions retain the established category vocabulary; these filters make
@@ -369,6 +394,24 @@ def product_refresh_interval(product: dict[str, Any], timestamp: int | None = No
     return HIGH_STOCK_REFRESH_INTERVAL
 
 
+def is_lazy_out_of_stock(product: dict[str, Any], timestamp: int | None = None) -> bool:
+    timestamp = timestamp if timestamp is not None else now_ts()
+    if safe_int(product.get("stock_count"), -1) != 0:
+        return False
+    out_since = safe_int(product.get("out_of_stock_since"), 0)
+    return bool(out_since and timestamp - out_since >= LAZY_OUT_OF_STOCK_AFTER)
+
+
+def is_lazy_refresh_product(product: dict[str, Any], timestamp: int | None = None) -> bool:
+    """Whether a product is reserved for the daily administrator refresh lane."""
+    return bool(product.get("platform_banned")) or is_lazy_out_of_stock(product, timestamp)
+
+
+def lazy_refresh_due_at(last_seen: int, timestamp: int) -> int:
+    """Return the next daily ultra-lazy refresh deadline."""
+    return last_seen + LAZY_REFRESH_INTERVAL
+
+
 def clean_text(value: Any, limit: int = 240) -> str:
     text = html.unescape(TAG_RE.sub(" ", str(value or "")))
     text = SPACE_RE.sub(" ", text).strip()
@@ -446,6 +489,7 @@ def classify_product(name: str, category_name: str = "") -> list[str]:
         category["key"]: category_matches(category)
         for category in CATEGORY_DEFINITIONS
     }
+    matched["relay"] = bool(relay_classification_reason(name))
     tier = next((key for key in ACCOUNT_TIER_PRIORITY if matched[key]), "")
     sms_status = ""
     if any(term.casefold() in title for term in SMS_UNVERIFIED_TERMS):
@@ -597,6 +641,10 @@ class Database:
                     last_seen INTEGER NOT NULL,
                     changed_at INTEGER NOT NULL,
                     out_of_stock_since INTEGER NOT NULL DEFAULT 0,
+                    off_shelf INTEGER NOT NULL DEFAULT 0,
+                    off_shelf_reason TEXT NOT NULL DEFAULT '',
+                    platform_banned INTEGER NOT NULL DEFAULT 0,
+                    platform_banned_reason TEXT NOT NULL DEFAULT '',
                     ai_classification_state TEXT NOT NULL DEFAULT 'pending',
                     ai_classified_at INTEGER NOT NULL DEFAULT 0,
                     ai_classification_error TEXT NOT NULL DEFAULT '',
@@ -611,6 +659,60 @@ class Database:
                     stock_count INTEGER NOT NULL,
                     recorded_at INTEGER NOT NULL,
                     FOREIGN KEY(goods_key) REFERENCES products(goods_key) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS product_comments (
+                    id TEXT PRIMARY KEY,
+                    goods_key TEXT NOT NULL,
+                    author TEXT NOT NULL DEFAULT '',
+                    avatar TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL DEFAULT '',
+                    images TEXT NOT NULL DEFAULT '[]',
+                    product_score REAL,
+                    shop_score REAL,
+                    experience_score REAL,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    admin_verified INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    pinned_at INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(goods_key) REFERENCES products(goods_key) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS product_comment_metrics (
+                    goods_key TEXT PRIMARY KEY,
+                    comment_count INTEGER NOT NULL DEFAULT 0,
+                    product_score_sum REAL NOT NULL DEFAULT 0,
+                    product_score_count INTEGER NOT NULL DEFAULT 0,
+                    shop_score_sum REAL NOT NULL DEFAULT 0,
+                    shop_score_count INTEGER NOT NULL DEFAULT 0,
+                    experience_score_sum REAL NOT NULL DEFAULT 0,
+                    experience_score_count INTEGER NOT NULL DEFAULT 0,
+                    rating_sum REAL NOT NULL DEFAULT 0,
+                    rating_count INTEGER NOT NULL DEFAULT 0,
+                    rating_average REAL NOT NULL DEFAULT 0,
+                    weighted_score REAL NOT NULL DEFAULT 0,
+                    latest_comment_at INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(goods_key) REFERENCES products(goods_key) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS product_comment_votes (
+                    comment_id TEXT NOT NULL,
+                    voter_key TEXT NOT NULL,
+                    value INTEGER NOT NULL CHECK (value IN (-1, 1)),
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (comment_id, voter_key),
+                    FOREIGN KEY(comment_id) REFERENCES product_comments(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS product_comment_replies (
+                    id TEXT PRIMARY KEY,
+                    comment_id TEXT NOT NULL,
+                    author TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL DEFAULT '',
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(comment_id) REFERENCES product_comments(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS settings (
@@ -656,6 +758,18 @@ class Database:
                     FOREIGN KEY(source_token) REFERENCES sources(token) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS sponsored_update_queue (
+                    source_token TEXT PRIMARY KEY,
+                    queue_position INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    matched INTEGER NOT NULL DEFAULT 0,
+                    changed INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(source_token) REFERENCES sources(token) ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_products_active ON products(active, last_seen DESC);
                 CREATE INDEX IF NOT EXISTS idx_products_source ON products(source_token, active);
                 CREATE INDEX IF NOT EXISTS idx_products_active_price
@@ -665,10 +779,20 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_products_source_refresh
                     ON products(source_token, active, last_seen);
                 CREATE INDEX IF NOT EXISTS idx_history_goods ON price_history(goods_key, recorded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_product_comments_goods
+                    ON product_comments(goods_key, pinned DESC, pinned_at DESC, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_comment_metrics_rating
+                    ON product_comment_metrics(weighted_score DESC, latest_comment_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_comment_votes_comment
+                    ON product_comment_votes(comment_id, value);
+                CREATE INDEX IF NOT EXISTS idx_comment_replies_comment
+                    ON product_comment_replies(comment_id, created_at ASC);
                 CREATE INDEX IF NOT EXISTS idx_proxy_daily_pool_success
                     ON proxy_daily_pool(pool_day, success_count, first_success_at);
                 CREATE INDEX IF NOT EXISTS idx_scan_seen_source
                     ON scan_seen(source_token, cycle_id);
+                CREATE INDEX IF NOT EXISTS idx_sponsored_update_queue
+                    ON sponsored_update_queue(status, queue_position);
                 """
             )
             source_columns = {row["name"] for row in db.execute("PRAGMA table_info(sources)")}
@@ -693,6 +817,14 @@ class Database:
                 db.execute(
                     "ALTER TABLE products ADD COLUMN out_of_stock_since INTEGER NOT NULL DEFAULT 0"
                 )
+            if "off_shelf" not in product_columns:
+                db.execute("ALTER TABLE products ADD COLUMN off_shelf INTEGER NOT NULL DEFAULT 0")
+            if "off_shelf_reason" not in product_columns:
+                db.execute("ALTER TABLE products ADD COLUMN off_shelf_reason TEXT NOT NULL DEFAULT ''")
+            if "platform_banned" not in product_columns:
+                db.execute("ALTER TABLE products ADD COLUMN platform_banned INTEGER NOT NULL DEFAULT 0")
+            if "platform_banned_reason" not in product_columns:
+                db.execute("ALTER TABLE products ADD COLUMN platform_banned_reason TEXT NOT NULL DEFAULT ''")
             if "ai_classification_state" not in product_columns:
                 db.execute(
                     "ALTER TABLE products ADD COLUMN ai_classification_state "
@@ -707,6 +839,22 @@ class Database:
                     "ALTER TABLE products ADD COLUMN ai_classification_error "
                     "TEXT NOT NULL DEFAULT ''"
                 )
+            comment_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(product_comments)")
+            }
+            if "avatar" not in comment_columns:
+                db.execute(
+                    "ALTER TABLE product_comments ADD COLUMN avatar TEXT NOT NULL DEFAULT ''"
+                )
+            for score_column in ("product_score", "shop_score", "experience_score"):
+                if score_column not in comment_columns:
+                    db.execute(f"ALTER TABLE product_comments ADD COLUMN {score_column} REAL")
+            for admin_column in ("is_admin", "admin_verified"):
+                if admin_column not in comment_columns:
+                    db.execute(
+                        f"ALTER TABLE product_comments ADD COLUMN {admin_column} INTEGER NOT NULL DEFAULT 0"
+                    )
+            self._rebuild_comment_metrics(db)
             db.execute(
                 """
                 UPDATE products SET out_of_stock_since = last_seen
@@ -719,6 +867,7 @@ class Database:
             db.execute(
                 "UPDATE sources SET base_url = ? WHERE base_url = ''", (LDXP_BASE_URL,)
             )
+            db.execute("UPDATE sponsored_update_queue SET status = 'pending' WHERE status = 'running'")
             db.execute("INSERT OR IGNORE INTO catalog_meta (id, revision) VALUES (1, 0)")
 
     def seed_sources(self) -> None:
@@ -905,6 +1054,134 @@ class Database:
             ).fetchone()
             return {"pending": int(row["pending"])}
 
+    def prepare_sponsored_update_queue(self, tokens: list[str] | None = None) -> dict[str, int | str]:
+        """Replace the sponsored queue with enabled shop sources currently needing attention."""
+        timestamp = now_ts()
+        with self.session() as db:
+            if tokens is None:
+                rows = db.execute(
+                    """
+                    SELECT token FROM sources
+                    WHERE enabled = 1 AND source_kind = 'shop_api' AND status IN ('error', 'paused')
+                    ORDER BY last_scan ASC, token ASC
+                    """
+                ).fetchall()
+                ordered_tokens = [str(row["token"]) for row in rows]
+            else:
+                wanted = list(dict.fromkeys(normalize_source(str(token)) for token in tokens if str(token).strip()))
+                if wanted:
+                    placeholders = ",".join("?" for _ in wanted)
+                    available = {
+                        str(row["token"])
+                        for row in db.execute(
+                            f"SELECT token FROM sources WHERE enabled = 1 AND source_kind = 'shop_api' AND token IN ({placeholders})",
+                            wanted,
+                        )
+                    }
+                    ordered_tokens = [token for token in wanted if token in available]
+                else:
+                    ordered_tokens = []
+            db.execute("DELETE FROM sponsored_update_queue")
+            db.executemany(
+                """
+                INSERT INTO sponsored_update_queue
+                    (source_token, queue_position, status, updated_at)
+                VALUES (?, ?, 'pending', ?)
+                """,
+                [(token, index, timestamp) for index, token in enumerate(ordered_tokens, start=1)],
+            )
+        return self.sponsored_update_summary()
+
+    def sponsored_update_summary(self) -> dict[str, int | str]:
+        with self.session() as db:
+            row = db.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(status = 'completed'), 0) AS completed,
+                       COALESCE(SUM(status = 'pending'), 0) AS pending,
+                       COALESCE(SUM(status = 'running'), 0) AS running,
+                       COALESCE(SUM(status = 'error'), 0) AS failed,
+                       COALESCE(MIN(CASE WHEN status IN ('pending', 'running', 'error') THEN queue_position END), 0) AS next_position
+                FROM sponsored_update_queue
+                """
+            ).fetchone()
+            current = db.execute(
+                """
+                SELECT queue_position, source_token, last_error FROM sponsored_update_queue
+                WHERE status IN ('running', 'error', 'pending')
+                ORDER BY queue_position ASC LIMIT 1
+                """
+            ).fetchone()
+        summary: dict[str, int | str] = dict(row) if row is not None else {}
+        summary.update({"current_token": "", "current_error": ""})
+        if current is not None:
+            summary["next_position"] = int(current["queue_position"])
+            summary["current_token"] = str(current["source_token"])
+            summary["current_error"] = str(current["last_error"] or "")
+        return summary
+
+    def resume_sponsored_update_queue(self) -> dict[str, int | str]:
+        timestamp = now_ts()
+        with self.session() as db:
+            db.execute(
+                """
+                UPDATE sponsored_update_queue
+                SET status = 'pending', updated_at = ?
+                WHERE status IN ('running', 'error')
+                """,
+                (timestamp,),
+            )
+        return self.sponsored_update_summary()
+
+    def start_next_sponsored_update(self) -> dict[str, Any] | None:
+        timestamp = now_ts()
+        with self.session() as db:
+            row = db.execute(
+                """
+                SELECT queue_position, source_token FROM sponsored_update_queue
+                WHERE status = 'pending' ORDER BY queue_position ASC LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            db.execute(
+                """
+                UPDATE sponsored_update_queue
+                SET status = 'running', attempts = attempts + 1, last_error = '', updated_at = ?
+                WHERE source_token = ?
+                """,
+                (timestamp, str(row["source_token"])),
+            )
+            source = db.execute(
+                "SELECT * FROM sources WHERE token = ?", (str(row["source_token"]),)
+            ).fetchone()
+        if source is None:
+            self.complete_sponsored_update(str(row["source_token"]), 0, 0)
+            return self.start_next_sponsored_update()
+        return {"position": int(row["queue_position"]), "source": dict(source)}
+
+    def complete_sponsored_update(self, token: str, matched: int, changed: int) -> None:
+        with self.session() as db:
+            db.execute(
+                """
+                UPDATE sponsored_update_queue
+                SET status = 'completed', matched = ?, changed = ?, last_error = '', updated_at = ?
+                WHERE source_token = ?
+                """,
+                (matched, changed, now_ts(), token),
+            )
+
+    def fail_sponsored_update(self, token: str, error: str) -> None:
+        with self.session() as db:
+            db.execute(
+                """
+                UPDATE sponsored_update_queue
+                SET status = 'error', last_error = ?, updated_at = ?
+                WHERE source_token = ?
+                """,
+                (clean_text(error, 500), now_ts(), token),
+            )
+
     def get_or_create_scan_checkpoint(self, source_token: str) -> dict[str, Any]:
         with self.session() as db:
             row = db.execute(
@@ -1045,21 +1322,31 @@ class Database:
                     dict(row)
                     for row in db.execute(
                         "SELECT * FROM sources "
-                        "WHERE enabled = 1 AND source_kind = 'shop_api' ORDER BY created_at ASC"
+                        "WHERE enabled = 1 AND source_kind IN ('shop_api', 'snapshot') "
+                        "AND (NOT EXISTS (SELECT 1 FROM products "
+                        "                WHERE products.source_token = sources.token AND products.active = 1) "
+                        "     OR EXISTS (SELECT 1 FROM products "
+                        "                WHERE products.source_token = sources.token "
+                        "                  AND products.active = 1 AND products.off_shelf = 0)) "
+                        "ORDER BY created_at ASC"
                     )
                 ]
         timestamp = now_ts()
         with self.session() as db:
             rows = db.execute(
                 """
-                SELECT source_token, price, stock_count, last_seen, out_of_stock_since
-                FROM products WHERE active = 1
+                SELECT source_token, price, stock_count, last_seen, out_of_stock_since, platform_banned
+                FROM products WHERE active = 1 AND off_shelf = 0
                 """
             ).fetchall()
             next_refresh_by_source: dict[str, int] = {}
             for row in rows:
                 product = dict(row)
-                due_at = int(product["last_seen"]) + product_refresh_interval(product, timestamp)
+                due_at = (
+                    lazy_refresh_due_at(int(product["last_seen"]), timestamp)
+                    if is_lazy_refresh_product(product, timestamp)
+                    else int(product["last_seen"]) + product_refresh_interval(product, timestamp)
+                )
                 token = str(product["source_token"])
                 previous = next_refresh_by_source.get(token)
                 if previous is None or due_at < previous:
@@ -1068,11 +1355,29 @@ class Database:
             sources = [
                 dict(row)
                 for row in db.execute(
-                    "SELECT * FROM sources WHERE enabled = 1 AND source_kind = 'shop_api'"
+                    "SELECT * FROM sources "
+                    "WHERE enabled = 1 AND source_kind IN ('shop_api', 'snapshot')"
                 )
             ]
+            active_source_tokens = {
+                str(row["source_token"])
+                for row in db.execute("SELECT DISTINCT source_token FROM products WHERE active = 1")
+            }
             for source in sources:
-                source["next_refresh_at"] = next_refresh_by_source.get(str(source["token"]), 0)
+                token = str(source["token"])
+                if token in next_refresh_by_source:
+                    source["next_refresh_at"] = next_refresh_by_source[token]
+                elif token in active_source_tokens:
+                    # Every active product is already off-shelf: preserve it in the archive
+                    # without spending normal scan traffic on it.
+                    source["next_refresh_at"] = timestamp + 365 * 24 * 60 * 60
+                else:
+                    # Empty sources have no product timestamps to drive the
+                    # scheduler. Their successful source scan is the watermark.
+                    last_scan = int(source.get("last_scan") or 0)
+                    source["next_refresh_at"] = (
+                        last_scan + SCAN_INTERVAL if last_scan else 0
+                    )
             sources.sort(
                 key=lambda source: (
                     int(source["next_refresh_at"]) > timestamp,
@@ -1239,7 +1544,8 @@ class Database:
                     stock_count, in_stock, tags, category_name, goods_type, link, image,
                     description_excerpt, create_time, first_seen, last_seen, changed_at,
                     out_of_stock_since, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    , off_shelf, off_shelf_reason, platform_banned, platform_banned_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, '', 0, '')
                 ON CONFLICT(goods_key) DO UPDATE SET
                     source_token = excluded.source_token,
                     source_name = excluded.source_name,
@@ -1258,7 +1564,11 @@ class Database:
                     last_seen = excluded.last_seen,
                     changed_at = CASE WHEN ? IS NULL THEN products.changed_at ELSE ? END,
                     out_of_stock_since = excluded.out_of_stock_since,
-                    active = 1
+                    active = 1,
+                    off_shelf = 0,
+                    off_shelf_reason = '',
+                    platform_banned = 0,
+                    platform_banned_reason = ''
                 """,
                 (
                     product["goods_key"],
@@ -1460,6 +1770,8 @@ class Database:
         product["tags"] = json.loads(product.get("tags") or "[]")
         product["in_stock"] = bool(product["in_stock"])
         product["active"] = bool(product["active"])
+        product["off_shelf"] = bool(product.get("off_shelf"))
+        product["platform_banned"] = bool(product.get("platform_banned"))
         return product
 
     def list_products(self) -> list[dict[str, Any]]:
@@ -1468,6 +1780,27 @@ class Database:
                 "SELECT * FROM products WHERE active = 1 ORDER BY changed_at DESC, price ASC"
             ).fetchall()
             return [self._product_row(row) for row in rows]
+
+    def list_source_products(self, source_token: str) -> list[dict[str, Any]]:
+        with self.session() as db:
+            rows = db.execute(
+                "SELECT * FROM products WHERE source_token = ? AND active = 1 AND off_shelf = 0 "
+                "AND platform_banned = 0 "
+                "ORDER BY goods_key ASC",
+                (source_token,),
+            ).fetchall()
+            return [self._product_row(row) for row in rows]
+
+    def off_shelf_product_keys(self, source_token: str) -> set[str]:
+        with self.session() as db:
+            return {
+                str(row["goods_key"])
+                for row in db.execute(
+                    "SELECT goods_key FROM products "
+                    "WHERE source_token = ? AND active = 1 AND off_shelf = 1",
+                    (source_token,),
+                )
+            }
 
     def source_token_from_link_search(self, search: str) -> str | None:
         reference = source_reference_from_link_search(search)
@@ -1494,16 +1827,36 @@ class Database:
         min_price: float = 0,
         max_price: float | None = None,
         include_left: bool = False,
+        rating_sort: bool = False,
+        exclude_lazy_refresh: bool = False,
+        oldest_seen_first: bool = False,
         offset: int = 0,
         limit: int = PRODUCT_STREAM_DEFAULT_LIMIT,
     ) -> dict[str, Any]:
         conditions = ["active = 1"]
         params: list[Any] = []
-        if category != "all":
+        if category == OFF_SHELF_CATEGORY["key"]:
+            conditions.append("off_shelf = 1")
+            conditions.append("platform_banned = 0")
+        elif category == PLATFORM_BANNED_CATEGORY["key"]:
+            conditions.append("platform_banned = 1")
+        else:
+            conditions.append("off_shelf = 0")
+            conditions.append("platform_banned = 0")
+        if category not in {"all", OFF_SHELF_CATEGORY["key"], PLATFORM_BANNED_CATEGORY["key"]}:
             conditions.append("tags LIKE ?")
             params.append(f'%"{category}"%')
-        if stock_only:
+        if stock_only and category not in {OFF_SHELF_CATEGORY["key"], PLATFORM_BANNED_CATEGORY["key"]}:
             conditions.append("in_stock = 1")
+        if exclude_lazy_refresh:
+            # Visitor refresh batches must never include archived listings, a
+            # platform-ban marker, or stock-zero products that have aged into
+            # the lazy lane.  The server/admin lane is the only route for them.
+            conditions.append("off_shelf = 0")
+            conditions.append(
+                "NOT (platform_banned = 1 OR (stock_count = 0 AND out_of_stock_since > 0 AND out_of_stock_since <= ?))"
+            )
+            params.append(now_ts() - LAZY_OUT_OF_STOCK_AFTER)
         conditions.append("price >= ?" if include_left else "price > ?")
         params.append(min_price)
         if max_price is not None:
@@ -1517,7 +1870,7 @@ class Database:
             params.append(source_key)
         elif query:
             conditions.append(
-                "LOWER(name || ' ' || source_name || ' ' || category_name || ' ' || link || ' ' || goods_key) LIKE ?"
+                "LOWER(name || ' ' || source_name || ' ' || category_name || ' ' || link || ' ' || products.goods_key) LIKE ?"
             )
             params.append(f"%{query}%")
 
@@ -1526,6 +1879,20 @@ class Database:
             "stock": "stock_count DESC, price ASC, name COLLATE NOCASE ASC, goods_key ASC",
             "updated": "changed_at DESC, price ASC, goods_key ASC",
         }[sort]
+        if oldest_seen_first:
+            order_by = "last_seen ASC, first_seen ASC, goods_key ASC"
+        product_from = "products"
+        if rating_sort:
+            product_from = (
+                "products LEFT JOIN product_comment_metrics AS comment_metrics "
+                "ON comment_metrics.goods_key = products.goods_key"
+            )
+            order_by = (
+                "COALESCE(comment_metrics.weighted_score, -1) DESC, "
+                "COALESCE(comment_metrics.rating_count, 0) DESC, "
+                "COALESCE(comment_metrics.latest_comment_at, products.changed_at) DESC, "
+                "products.goods_key ASC"
+            )
         where = " AND ".join(conditions)
         with self.session() as db:
             total = int(
@@ -1535,7 +1902,7 @@ class Database:
             )
             rows = db.execute(
                 f"""
-                SELECT * FROM products
+                SELECT products.* FROM {product_from}
                 WHERE {where}
                 ORDER BY {order_by}
                 LIMIT ? OFFSET ?
@@ -1578,6 +1945,96 @@ class Database:
             if result.rowcount:
                 self._bump_catalog_revision(db)
             return result.rowcount > 0
+
+    def mark_product_off_shelf(self, goods_key: str, reason: str = "") -> dict[str, Any] | None:
+        timestamp = now_ts()
+        with self.session() as db:
+            row = db.execute("SELECT * FROM products WHERE goods_key = ?", (goods_key,)).fetchone()
+            if row is None:
+                return None
+            previous = dict(row)
+            changed = not bool(previous.get("off_shelf")) or int(previous.get("stock_count") or -1) != 0
+            db.execute(
+                """
+                UPDATE products SET stock_count = 0, in_stock = 0, active = 1,
+                    off_shelf = 1, off_shelf_reason = ?,
+                    out_of_stock_since = CASE WHEN out_of_stock_since = 0 THEN ? ELSE out_of_stock_since END,
+                    last_seen = ?, changed_at = CASE WHEN ? THEN ? ELSE changed_at END
+                WHERE goods_key = ?
+                """,
+                (clean_text(reason, 300), timestamp, timestamp, int(changed), timestamp, goods_key),
+            )
+            if changed:
+                self._bump_catalog_revision(db)
+            saved = db.execute("SELECT * FROM products WHERE goods_key = ?", (goods_key,)).fetchone()
+            return self._product_row(saved) if saved is not None else None
+
+    def mark_source_platform_banned(self, source_token: str, reason: str = "") -> list[dict[str, Any]]:
+        """Archive all active products of a platform-banned shop in its exclusive category."""
+        timestamp = now_ts()
+        saved_products: list[dict[str, Any]] = []
+        with self.session() as db:
+            rows = db.execute(
+                "SELECT * FROM products WHERE source_token = ? AND active = 1", (source_token,)
+            ).fetchall()
+            if not rows:
+                return saved_products
+            changed_keys = [
+                str(row["goods_key"])
+                for row in rows
+                if not bool(row["platform_banned"])
+                or int(row["stock_count"] or -1) != 0
+                or bool(row["off_shelf"])
+            ]
+            db.execute(
+                """
+                UPDATE products SET stock_count = 0, in_stock = 0, active = 1,
+                    off_shelf = 0, off_shelf_reason = '', platform_banned = 1,
+                    platform_banned_reason = ?,
+                    out_of_stock_since = CASE WHEN out_of_stock_since = 0 THEN ? ELSE out_of_stock_since END,
+                    last_seen = ?, changed_at = CASE WHEN goods_key IN ({keys}) THEN ? ELSE changed_at END
+                WHERE source_token = ? AND active = 1
+                """.format(keys=",".join("?" for _ in changed_keys) if changed_keys else "''"),
+                [clean_text(reason, 300), timestamp, timestamp, *changed_keys, timestamp, source_token],
+            )
+            if changed_keys:
+                self._bump_catalog_revision(db)
+            saved_products = [
+                self._product_row(row)
+                for row in db.execute(
+                    "SELECT * FROM products WHERE source_token = ? AND active = 1", (source_token,)
+                )
+            ]
+        return saved_products
+
+    def mark_product_link_verified(self, goods_key: str) -> dict[str, Any] | None:
+        """Keep a successfully fetched product link, but discard unverified directory stock."""
+        timestamp = now_ts()
+        with self.session() as db:
+            row = db.execute("SELECT * FROM products WHERE goods_key = ?", (goods_key,)).fetchone()
+            if row is None:
+                return None
+            previous = dict(row)
+            changed = (
+                bool(previous.get("off_shelf"))
+                or bool(previous.get("platform_banned"))
+                or int(previous.get("stock_count") or -1) != -1
+                or not bool(previous.get("in_stock"))
+            )
+            db.execute(
+                """
+                UPDATE products SET stock_count = -1, in_stock = 1, active = 1,
+                    off_shelf = 0, off_shelf_reason = '', out_of_stock_since = 0,
+                    platform_banned = 0, platform_banned_reason = '',
+                    last_seen = ?, changed_at = CASE WHEN ? THEN ? ELSE changed_at END
+                WHERE goods_key = ?
+                """,
+                (timestamp, int(changed), timestamp, goods_key),
+            )
+            if changed:
+                self._bump_catalog_revision(db)
+            saved = db.execute("SELECT * FROM products WHERE goods_key = ?", (goods_key,)).fetchone()
+            return self._product_row(saved) if saved is not None else None
 
     def deactivate_source_products(self, source_token: str, goods_keys: set[str]) -> set[str]:
         if not goods_keys:
@@ -1622,18 +2079,327 @@ class Database:
                 )
             ]
 
+    @staticmethod
+    def _metric_row(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            return {
+                "comment_count": 0,
+                "rating_count": 0,
+                "rating_average": 0.0,
+                "weighted_score": 0.0,
+                "latest_comment_at": 0,
+                "product_score_average": 0.0,
+                "shop_score_average": 0.0,
+                "experience_score_average": 0.0,
+            }
+        metric = dict(row)
+        for prefix in ("product_score", "shop_score", "experience_score"):
+            count = int(metric.get(f"{prefix}_count") or 0)
+            metric[f"{prefix}_average"] = (
+                float(metric.get(f"{prefix}_sum") or 0) / count if count else 0.0
+            )
+        return metric
+
+    @staticmethod
+    def _refresh_comment_metrics(db: sqlite3.Connection, goods_key: str) -> None:
+        row = db.execute(
+            """
+            SELECT COUNT(*) AS comment_count, MAX(created_at) AS latest_comment_at,
+                   COALESCE(SUM(product_score), 0) AS product_score_sum,
+                   COUNT(product_score) AS product_score_count,
+                   COALESCE(SUM(shop_score), 0) AS shop_score_sum,
+                   COUNT(shop_score) AS shop_score_count,
+                   COALESCE(SUM(experience_score), 0) AS experience_score_sum,
+                   COUNT(experience_score) AS experience_score_count
+            FROM product_comments WHERE goods_key = ?
+            """,
+            (goods_key,),
+        ).fetchone()
+        assert row is not None
+        values = dict(row)
+        rating_sum = sum(
+            float(values[f"{name}_sum"] or 0)
+            for name in ("product_score", "shop_score", "experience_score")
+        )
+        rating_count = sum(
+            int(values[f"{name}_count"] or 0)
+            for name in ("product_score", "shop_score", "experience_score")
+        )
+        average = rating_sum / rating_count if rating_count else 0.0
+        weighted = ((average * rating_count) + 4.0 * 12) / (rating_count + 12) if rating_count else 0.0
+        db.execute(
+            """
+            INSERT INTO product_comment_metrics (
+                goods_key, comment_count, product_score_sum, product_score_count,
+                shop_score_sum, shop_score_count, experience_score_sum, experience_score_count,
+                rating_sum, rating_count, rating_average, weighted_score, latest_comment_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(goods_key) DO UPDATE SET
+                comment_count = excluded.comment_count,
+                product_score_sum = excluded.product_score_sum,
+                product_score_count = excluded.product_score_count,
+                shop_score_sum = excluded.shop_score_sum,
+                shop_score_count = excluded.shop_score_count,
+                experience_score_sum = excluded.experience_score_sum,
+                experience_score_count = excluded.experience_score_count,
+                rating_sum = excluded.rating_sum,
+                rating_count = excluded.rating_count,
+                rating_average = excluded.rating_average,
+                weighted_score = excluded.weighted_score,
+                latest_comment_at = excluded.latest_comment_at
+            """,
+            (
+                goods_key, int(values["comment_count"] or 0),
+                float(values["product_score_sum"] or 0), int(values["product_score_count"] or 0),
+                float(values["shop_score_sum"] or 0), int(values["shop_score_count"] or 0),
+                float(values["experience_score_sum"] or 0), int(values["experience_score_count"] or 0),
+                rating_sum, rating_count, average, weighted, int(values["latest_comment_at"] or 0),
+            ),
+        )
+
+    @classmethod
+    def _rebuild_comment_metrics(cls, db: sqlite3.Connection) -> None:
+        keys = [
+            str(row["goods_key"])
+            for row in db.execute("SELECT DISTINCT goods_key FROM product_comments")
+        ]
+        for goods_key in keys:
+            cls._refresh_comment_metrics(db, goods_key)
+
+    def comment_metrics(self, goods_keys: list[str]) -> dict[str, dict[str, Any]]:
+        keys = list(dict.fromkeys(key for key in goods_keys if key))[:PRODUCT_STREAM_MAX_LIMIT]
+        metrics = {key: self._metric_row(None) for key in keys}
+        if not keys:
+            return metrics
+        placeholders = ",".join("?" for _ in keys)
+        with self.session() as db:
+            rows = db.execute(
+                f"SELECT * FROM product_comment_metrics WHERE goods_key IN ({placeholders})", keys
+            ).fetchall()
+            for row in rows:
+                metrics[str(row["goods_key"])] = self._metric_row(row)
+        return metrics
+
+    @staticmethod
+    def _comment_row(row: sqlite3.Row) -> dict[str, Any]:
+        comment = dict(row)
+        try:
+            image_names = json.loads(comment.get("images") or "[]")
+        except json.JSONDecodeError:
+            image_names = []
+        comment["images"] = [
+            f"api/comment-images/{urllib.parse.quote(str(name))}"
+            for name in image_names
+            if isinstance(name, str) and name
+        ]
+        avatar = str(comment.get("avatar") or "")
+        comment["avatar"] = (
+            f"api/comment-images/{urllib.parse.quote(avatar)}"
+            if re.fullmatch(r"avatar-[0-9a-f]{32}\.jpg", avatar)
+            else ""
+        )
+        comment["pinned"] = bool(comment.get("pinned"))
+        comment["is_admin"] = bool(comment.get("is_admin"))
+        comment["admin_verified"] = bool(comment.get("admin_verified"))
+        comment["upvotes"] = int(comment.get("upvotes") or 0)
+        comment["downvotes"] = int(comment.get("downvotes") or 0)
+        return comment
+
+    def comments(self, goods_key: str, limit: int = 100, after: int = 0) -> list[dict[str, Any]]:
+        limit = max(1, min(100, limit))
+        with self.session() as db:
+            rows = db.execute(
+                """
+                SELECT c.id, c.goods_key, c.author, c.avatar, c.body, c.images, c.product_score, c.shop_score,
+                       c.experience_score, c.is_admin, c.admin_verified, c.pinned, c.pinned_at, c.created_at,
+                       (SELECT COUNT(*) FROM product_comment_votes v WHERE v.comment_id = c.id AND v.value = 1) AS upvotes,
+                       (SELECT COUNT(*) FROM product_comment_votes v WHERE v.comment_id = c.id AND v.value = -1) AS downvotes
+                FROM product_comments c WHERE c.goods_key = ? AND c.created_at > ?
+                ORDER BY pinned DESC, pinned_at DESC, created_at DESC LIMIT ?
+                """,
+                (goods_key, max(0, after), limit),
+            ).fetchall()
+            comments = [self._comment_row(row) for row in rows]
+            for comment in comments:
+                reply_rows = db.execute(
+                    "SELECT id, comment_id, author, body, is_admin, created_at "
+                    "FROM product_comment_replies WHERE comment_id = ? ORDER BY created_at ASC",
+                    (comment["id"],),
+                ).fetchall()
+                comment["replies"] = [
+                    {**dict(reply), "is_admin": bool(reply["is_admin"])} for reply in reply_rows
+                ]
+            return comments
+
+    def comment_previews(self, goods_keys: list[str]) -> dict[str, list[dict[str, Any]]]:
+        keys = list(dict.fromkeys(key for key in goods_keys if key))[:PRODUCT_STREAM_MAX_LIMIT]
+        previews = {key: [] for key in keys}
+        with self.session() as db:
+            for goods_key in keys:
+                rows = db.execute(
+                    """
+                    SELECT c.id, c.goods_key, c.author, c.avatar, c.body, c.images, c.product_score, c.shop_score,
+                           c.experience_score, c.is_admin, c.admin_verified, c.pinned, c.pinned_at, c.created_at,
+                           (SELECT COUNT(*) FROM product_comment_votes v WHERE v.comment_id = c.id AND v.value = 1) AS upvotes,
+                           (SELECT COUNT(*) FROM product_comment_votes v WHERE v.comment_id = c.id AND v.value = -1) AS downvotes
+                    FROM product_comments c WHERE c.goods_key = ?
+                    ORDER BY pinned DESC, pinned_at DESC, created_at DESC LIMIT ?
+                    """,
+                    (goods_key, COMMENT_PREVIEW_LIMIT),
+                ).fetchall()
+                previews[goods_key] = [self._comment_row(row) for row in rows]
+        return previews
+
+    def add_comment(
+        self, goods_key: str, author: str, avatar: str, body: str, image_names: list[str],
+        scores: dict[str, float | None], is_admin: bool = False,
+    ) -> dict[str, Any]:
+        comment_id = uuid.uuid4().hex
+        timestamp = now_ts()
+        with self.session() as db:
+            product = db.execute(
+                "SELECT 1 FROM products WHERE goods_key = ? AND active = 1", (goods_key,)
+            ).fetchone()
+            if product is None:
+                raise KeyError(goods_key)
+            db.execute(
+                """
+                INSERT INTO product_comments
+                    (id, goods_key, author, avatar, body, images, product_score, shop_score, experience_score, is_admin, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    comment_id,
+                    goods_key,
+                    author,
+                    avatar,
+                    body,
+                    json.dumps(image_names, ensure_ascii=False, separators=(",", ":")),
+                    scores.get("product_score"),
+                    scores.get("shop_score"),
+                    scores.get("experience_score"),
+                    1 if is_admin else 0,
+                    timestamp,
+                ),
+            )
+            self._refresh_comment_metrics(db, goods_key)
+            row = db.execute(
+                "SELECT id, goods_key, author, avatar, body, images, product_score, shop_score, "
+                "experience_score, is_admin, admin_verified, pinned, pinned_at, created_at "
+                "FROM product_comments WHERE id = ?",
+                (comment_id,),
+            ).fetchone()
+            assert row is not None
+            return self._comment_row(row)
+
+    def set_comment_pinned(self, goods_key: str, comment_id: str, pinned: bool) -> dict[str, Any] | None:
+        timestamp = now_ts()
+        with self.session() as db:
+            row = db.execute(
+                "SELECT id FROM product_comments WHERE id = ? AND goods_key = ?",
+                (comment_id, goods_key),
+            ).fetchone()
+            if row is None:
+                return None
+            if pinned:
+                pinned_count = int(
+                    db.execute(
+                        "SELECT COUNT(*) AS total FROM product_comments WHERE goods_key = ? AND pinned = 1",
+                        (goods_key,),
+                    ).fetchone()["total"]
+                )
+                if pinned_count >= COMMENT_PREVIEW_LIMIT:
+                    raise ValueError("A product can have at most 10 pinned comments.")
+            db.execute(
+                "UPDATE product_comments SET pinned = ?, pinned_at = ? WHERE id = ?",
+                (1 if pinned else 0, timestamp if pinned else 0, comment_id),
+            )
+            updated = db.execute(
+                "SELECT id, goods_key, author, avatar, body, images, product_score, shop_score, "
+                "experience_score, is_admin, admin_verified, pinned, pinned_at, created_at "
+                "FROM product_comments WHERE id = ?",
+                (comment_id,),
+            ).fetchone()
+            assert updated is not None
+            return self._comment_row(updated)
+
+    def vote_comment(self, goods_key: str, comment_id: str, voter_key: str, value: int) -> dict[str, Any] | None:
+        with self.session() as db:
+            row = db.execute(
+                "SELECT id FROM product_comments WHERE id = ? AND goods_key = ?",
+                (comment_id, goods_key),
+            ).fetchone()
+            if row is None:
+                return None
+            db.execute(
+                """
+                INSERT INTO product_comment_votes (comment_id, voter_key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(comment_id, voter_key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (comment_id, voter_key, value, now_ts()),
+            )
+            totals = db.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN value = 1 THEN 1 ELSE 0 END) AS upvotes,
+                    SUM(CASE WHEN value = -1 THEN 1 ELSE 0 END) AS downvotes
+                FROM product_comment_votes WHERE comment_id = ?
+                """,
+                (comment_id,),
+            ).fetchone()
+            return {
+                "id": comment_id,
+                "upvotes": int(totals["upvotes"] or 0),
+                "downvotes": int(totals["downvotes"] or 0),
+                "viewer_vote": value,
+            }
+
+    def set_comment_verified(self, goods_key: str, comment_id: str, verified: bool) -> bool:
+        with self.session() as db:
+            result = db.execute(
+                "UPDATE product_comments SET admin_verified = ? WHERE id = ? AND goods_key = ?",
+                (1 if verified else 0, comment_id, goods_key),
+            )
+            return result.rowcount > 0
+
+    def add_comment_reply(
+        self, goods_key: str, comment_id: str, author: str, body: str, is_admin: bool
+    ) -> dict[str, Any] | None:
+        reply_id = uuid.uuid4().hex
+        timestamp = now_ts()
+        with self.session() as db:
+            exists = db.execute(
+                "SELECT id FROM product_comments WHERE id = ? AND goods_key = ?",
+                (comment_id, goods_key),
+            ).fetchone()
+            if exists is None:
+                return None
+            db.execute(
+                "INSERT INTO product_comment_replies (id, comment_id, author, body, is_admin, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (reply_id, comment_id, author, body, 1 if is_admin else 0, timestamp),
+            )
+            return {
+                "id": reply_id, "comment_id": comment_id, "author": author, "body": body,
+                "is_admin": is_admin, "created_at": timestamp,
+            }
+
     def stats(self) -> dict[str, Any]:
         category_columns = ",\n                       ".join(
-            f"COALESCE(SUM(CASE WHEN tags LIKE '%\"{item['key']}\"%' THEN 1 ELSE 0 END), 0) AS category_{index}"
+            f"COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND tags LIKE '%\"{item['key']}\"%' THEN 1 ELSE 0 END), 0) AS category_{index}"
             for index, item in enumerate(CATEGORY_DEFINITIONS)
         )
         with self.session() as db:
             product = db.execute(
                 f"""
-                SELECT COUNT(*) AS total,
-                       COALESCE(SUM(CASE WHEN in_stock = 1 THEN 1 ELSE 0 END), 0) AS in_stock,
-                       COALESCE(MIN(CASE WHEN price > 0 THEN price END), 0) AS lowest_price,
+                SELECT COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 THEN 1 ELSE 0 END), 0) AS total,
+                       COALESCE(SUM(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND in_stock = 1 THEN 1 ELSE 0 END), 0) AS in_stock,
+                       COALESCE(MIN(CASE WHEN off_shelf = 0 AND platform_banned = 0 AND price > 0 THEN price END), 0) AS lowest_price,
                        COALESCE(MAX(last_seen), 0) AS last_scan,
+                       COALESCE(SUM(CASE WHEN off_shelf = 1 THEN 1 ELSE 0 END), 0) AS off_shelf_count,
+                       COALESCE(SUM(CASE WHEN platform_banned = 1 THEN 1 ELSE 0 END), 0) AS platform_banned_count,
                        {category_columns}
                 FROM products WHERE active = 1
                 """
@@ -1651,6 +2417,9 @@ class Database:
                 "category_counts": {
                     item["key"]: product[f"category_{index}"]
                     for index, item in enumerate(CATEGORY_DEFINITIONS)
+                } | {
+                    OFF_SHELF_CATEGORY["key"]: product["off_shelf_count"],
+                    PLATFORM_BANNED_CATEGORY["key"]: product["platform_banned_count"],
                 },
             }
 
@@ -1661,6 +2430,55 @@ class LDXPError(RuntimeError):
 
 class LDXPTransportError(LDXPError):
     pass
+
+
+def is_off_shelf_error(error: Exception) -> bool:
+    message = str(error).strip().lower()
+    markers = (
+        "商品未上架", "商品已下架", "商品不存在", "商品不存在或已下架",
+        "goods not found", "item not found", "not listed", "off shelf", "off-shelf",
+    )
+    return any(marker in message for marker in markers)
+
+
+def is_platform_banned_error(error: Exception) -> bool:
+    message = str(error).strip().casefold()
+    markers = (
+        "商家已被封禁",
+        "店铺已被封禁",
+        "商家已被关闭交易",
+        "店铺已被关闭交易",
+        "关闭交易，有疑问请联系平台客服",
+        "平台封禁",
+        "merchant has been banned",
+        "shop has been banned",
+        "platform banned",
+    )
+    return any(marker in message for marker in markers)
+
+
+def is_access_error(error: Exception) -> bool:
+    """Whether retrying later may help because the route itself failed."""
+    if isinstance(error, (LDXPTransportError, urllib.error.URLError, TimeoutError, OSError)):
+        return True
+    message = str(error).strip().casefold()
+    markers = (
+        "http error",
+        "request failed",
+        "connection",
+        "proxy",
+        "blocked",
+        "connect timeout",
+        "timed out",
+        "anti-bot challenge",
+        "expecting value",
+        "gzip",
+        "forbidden",
+        "origin error",
+        "bad gateway",
+        "service unavailable",
+    )
+    return any(marker in message for marker in markers)
 
 
 class SCDNProxySource:
@@ -1680,8 +2498,11 @@ class SCDNProxySource:
 
     def fetch_page(self, page: int) -> tuple[list[ProxyEndpoint], int]:
         page = max(1, page)
+        api_mode = "api/get_proxy.php" in self.page_url
         query = urllib.parse.urlencode(
-            {"page": page, "protocol": self.protocol.upper(), "per_page": self.page_size}
+            {"protocol": self.protocol, "count": min(20, self.page_size)}
+            if api_mode
+            else {"page": page, "protocol": self.protocol.upper(), "per_page": self.page_size}
         )
         separator = "&" if "?" in self.page_url else "?"
         request = urllib.request.Request(
@@ -1695,9 +2516,16 @@ class SCDNProxySource:
             raise LDXPError(f"SCDN proxy fetch failed: {exc}") from exc
         if not isinstance(payload, dict):
             raise LDXPError("SCDN proxy page returned an invalid response")
-        table_html = str(payload.get("table_html") or "")
-        total_pages = max(1, safe_int(payload.get("totalPages"), 1))
-        endpoints = re.findall(r"data-proxy=[\"']([^\"']+)[\"']", table_html)
+        if api_mode:
+            data = payload.get("data") or {}
+            endpoints = data.get("proxies") if isinstance(data, dict) else []
+            if not isinstance(endpoints, list):
+                endpoints = []
+            total_pages = 1
+        else:
+            table_html = str(payload.get("table_html") or "")
+            total_pages = max(1, safe_int(payload.get("totalPages"), 1))
+            endpoints = re.findall(r"data-proxy=[\"']([^\"']+)[\"']", table_html)
         candidates: list[ProxyEndpoint] = []
         seen: set[str] = set()
         for value in endpoints:
@@ -1760,6 +2588,9 @@ class LDXPClient:
             data=body,
             headers={
                 "Accept": "application/json, text/plain, */*",
+                # Some proxy exits forward a gzip body without decoding it.
+                # Request identity encoding so urllib receives JSON bytes directly.
+                "Accept-Encoding": "identity",
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 "User-Agent": "Mozilla/5.0 (compatible; LDXPPriceScanner/1.0)",
                 "Visitorid": self.visitor_id,
@@ -1818,6 +2649,20 @@ class LDXPClient:
             )
         return json.loads(completed.stdout.decode("utf-8"))
 
+    @staticmethod
+    def _decode_json_body(body: bytes) -> Any:
+        # A few HTTP proxy implementations preserve gzip bytes while omitting
+        # or rewriting Content-Encoding.  Detect the gzip magic instead of
+        # trusting the header so local scans remain portable across exits.
+        if body[:2] == b"\x1f\x8b":
+            body = gzip.decompress(body)
+        if body.lstrip().lower().startswith((b"<html", b"<!doctype html")):
+            raise LDXPError(
+                "LDXP returned a browser anti-bot challenge instead of API JSON; "
+                "use an approved/allowlisted network route"
+            )
+        return json.loads(body.decode("utf-8"))
+
     def post(self, path: str, fields: dict[str, Any]) -> Any:
         body = urllib.parse.urlencode(
             {key: "" if value is None else value for key, value in fields.items()}
@@ -1841,7 +2686,7 @@ class LDXPClient:
                     else:
                         request = self._request(path, body)
                         with opener.open(request, timeout=self.timeout) as response:
-                            payload = json.loads(response.read().decode("utf-8"))
+                            payload = self._decode_json_body(response.read())
                 except (
                     urllib.error.URLError,
                     OSError,
@@ -2003,6 +2848,39 @@ def product_from_api(
         "link": str(item.get("link") or f"{base_url.rstrip('/')}/item/{goods_key}"),
         "image": str(item.get("image") or ""),
         "description_excerpt": clean_text(item.get("description")),
+        "create_time": safe_int(item.get("create_time")),
+    }
+
+
+def product_from_local_scan(
+    item: dict[str, Any], token: str, source_name: str, base_url: str = LDXP_BASE_URL
+) -> dict[str, Any] | None:
+    """Accept either raw shop API items or the normalized local scanner payload."""
+    if "extend" in item or "stock_count" not in item or not isinstance(item.get("tags"), list):
+        return product_from_api(item, token, source_name, base_url)
+    goods_key = clean_text(item.get("goods_key"), 200)
+    name = clean_text(item.get("name"), 500)
+    if not goods_key or not name:
+        return None
+    tags = normalize_ai_tags(item.get("tags")) or classify_product(name)
+    if not tags:
+        return None
+    stock_count = safe_int(item.get("stock_count"), -1)
+    return {
+        "goods_key": goods_key,
+        "source_token": token,
+        "source_name": source_name,
+        "name": name,
+        "price": safe_float(item.get("price")),
+        "market_price": safe_float(item.get("market_price")),
+        "stock_count": stock_count,
+        "in_stock": stock_count != 0 and bool(item.get("in_stock", True)),
+        "tags": tags,
+        "category_name": clean_text(item.get("category_name"), 200),
+        "goods_type": clean_text(item.get("goods_type"), 80),
+        "link": clean_text(item.get("link") or f"{base_url.rstrip('/')}/item/{goods_key}", 2000),
+        "image": clean_text(item.get("image"), 2000),
+        "description_excerpt": clean_text(item.get("description_excerpt"), 2000),
         "create_time": safe_int(item.get("create_time")),
     }
 
@@ -2205,6 +3083,7 @@ class ScannerService:
         self.auto_scan_enabled = auto_scan_enabled
         self.source_interval = LDXP_SOURCE_INTERVAL
         self.proxy_source_interval = LDXP_PROXY_SOURCE_INTERVAL
+        self._temporary_source_interval: float | None = None
         self._scan_lock = threading.Lock()
         self._scan_state_lock = threading.RLock()
         self._local_ingest_lock = threading.Lock()
@@ -2220,6 +3099,12 @@ class ScannerService:
         self._submitted_source_scan_queue: queue.Queue[str] = queue.Queue()
         self._submitted_source_scan_tokens: set[str] = set()
         self._submitted_source_scan_worker: threading.Thread | None = None
+        self._sponsored_update_lock = threading.Lock()
+        self._sponsored_update_stop = threading.Event()
+        self._sponsored_update_state_lock = threading.RLock()
+        self._sponsored_update_running = False
+        self._sponsored_update_current = ""
+        self._sponsored_update_error = ""
         self._product_refresh_lock = threading.Lock()
         self._refreshing_products: set[str] = set()
         self._stop = threading.Event()
@@ -2233,6 +3118,8 @@ class ScannerService:
         self._scan_reason = ""
         self._active_source_token = ""
         self._pending_scan_sources: set[str] = set()
+        self._browser_factory_leases: dict[str, dict[str, Any]] = {}
+        self._browser_factory_lock = threading.Lock()
         self.ai_classifying = False
         self.ai_classification_total = 0
         self.ai_classification_processed = 0
@@ -2300,6 +3187,119 @@ class ScannerService:
                 "pending_sources": len(self._pending_scan_sources),
             }
 
+    def sponsored_update_status(self) -> dict[str, Any]:
+        with self._sponsored_update_state_lock:
+            status = self.database.sponsored_update_summary()
+            status.update(
+                {
+                    "running": self._sponsored_update_running,
+                    "stop_requested": self._sponsored_update_stop.is_set(),
+                    "current_token": self._sponsored_update_current or status.get("current_token", ""),
+                    "last_error": self._sponsored_update_error or status.get("current_error", ""),
+                }
+            )
+            return status
+
+    def prepare_sponsored_updates(self) -> dict[str, Any]:
+        if self._sponsored_update_lock.locked():
+            raise RuntimeError("赞助更新正在运行，不能重新整理队列")
+        status = self.database.prepare_sponsored_update_queue()
+        self.events.publish("sponsored_update", {"phase": "prepared", **self.sponsored_update_status()})
+        return status
+
+    def _archive_platform_banned_source(self, token: str, message: str) -> int:
+        archived = self.database.mark_source_platform_banned(token, message)
+        self.database.update_source_scan(
+            token, status="banned", error=message, count=len(archived), scanned=True
+        )
+        for product in archived:
+            self.events.publish("product", {"change": "platform_banned", "product": product})
+        return len(archived)
+
+    def start_sponsored_updates(self) -> dict[str, Any]:
+        if self.scanning or self._local_ingest_lock.locked():
+            return {"started": False, "busy": True, **self.sponsored_update_status()}
+        if not self._sponsored_update_lock.acquire(blocking=False):
+            return {"started": False, "joined": True, **self.sponsored_update_status()}
+        self.database.resume_sponsored_update_queue()
+        self._sponsored_update_stop.clear()
+        with self._sponsored_update_state_lock:
+            self._sponsored_update_running = True
+            self._sponsored_update_current = ""
+            self._sponsored_update_error = ""
+        thread = threading.Thread(
+            target=self._run_sponsored_updates,
+            name="sponsored-update-scanner",
+            daemon=True,
+        )
+        thread.start()
+        status = self.sponsored_update_status()
+        self.events.publish("sponsored_update", {"phase": "started", **status})
+        return {"started": True, **status}
+
+    def stop_sponsored_updates(self) -> dict[str, Any]:
+        if not self._sponsored_update_lock.locked():
+            return {"stopping": False, **self.sponsored_update_status()}
+        self._sponsored_update_stop.set()
+        status = self.sponsored_update_status()
+        self.events.publish("sponsored_update", {"phase": "stop_requested", **status})
+        return {"stopping": True, **status}
+
+    def _run_sponsored_updates(self) -> None:
+        try:
+            # One normal store per click. Platform-banned stores are terminal
+            # records, so skip them immediately without consuming that refresh.
+            while not self._stop.is_set() and not self._sponsored_update_stop.is_set():
+                item = self.database.start_next_sponsored_update()
+                if item is None:
+                    self.events.publish("sponsored_update", {"phase": "completed", **self.sponsored_update_status()})
+                    return
+                token = str(item["source"]["token"])
+                with self._sponsored_update_state_lock:
+                    self._sponsored_update_current = token
+                self.database.update_source_scan(token, status="scanning")
+                self.events.publish(
+                    "sponsored_update",
+                    {"phase": "source_started", "position": item["position"], **self.sponsored_update_status()},
+                )
+                try:
+                    matched, changed = self._scan_source(token)
+                except Exception as exc:
+                    message = str(exc) or exc.__class__.__name__
+                    if not is_access_error(exc):
+                        archived_count = self._archive_platform_banned_source(token, message)
+                        self.database.complete_sponsored_update(token, 0, archived_count)
+                        self.events.publish(
+                            "sponsored_update",
+                            {
+                                "phase": "source_banned",
+                                "archived": archived_count,
+                                "matched": 0,
+                                "changed": archived_count,
+                                **self.sponsored_update_status(),
+                            },
+                        )
+                        continue
+                    self.database.update_source_scan(token, status="error", error=message, count=None)
+                    self.database.fail_sponsored_update(token, message)
+                    with self._sponsored_update_state_lock:
+                        self._sponsored_update_error = message
+                    self.events.publish("sponsored_update", {"phase": "paused", **self.sponsored_update_status()})
+                    return
+                self.database.complete_sponsored_update(token, matched, changed)
+                self.events.publish(
+                    "sponsored_update",
+                    {"phase": "source_completed", "matched": matched, "changed": changed, **self.sponsored_update_status()},
+                )
+                return
+        finally:
+            with self._sponsored_update_state_lock:
+                self._sponsored_update_running = False
+                self._sponsored_update_current = ""
+            self._sponsored_update_lock.release()
+            self.events.publish("sponsored_update", {"phase": "idle", **self.sponsored_update_status()})
+            self._publish_snapshot()
+
     def _begin_scan(self, reason: str) -> None:
         with self._scan_state_lock:
             self.scanning = True
@@ -2312,6 +3312,68 @@ class ScannerService:
     def _set_pending_scan_sources(self, sources: list[dict[str, Any]]) -> None:
         with self._scan_state_lock:
             self._pending_scan_sources = {str(source["token"]) for source in sources}
+
+    def claim_browser_factory_batch(self, multiplier: int = 1) -> dict[str, Any]:
+        timestamp = now_ts()
+        lease_id = uuid.uuid4().hex
+        multiplier = max(1, min(5, safe_int(multiplier, 1)))
+        limit = BROWSER_FACTORY_BATCH_SIZE * multiplier
+        daily_sources = self.database.list_sources_due_for_scan(scheduled=True)
+        with self._browser_factory_lock, self._scan_state_lock:
+            self._browser_factory_leases = {
+                token: lease for token, lease in self._browser_factory_leases.items()
+                if safe_int(lease.get("expires_at"), 0) > timestamp
+            }
+            current_tokens = [
+                token for token in self._pending_scan_sources
+                if token != self._active_source_token and token not in self._browser_factory_leases
+            ]
+            current_tokens.sort(
+                key=lambda token: safe_int((self.database.get_source(token) or {}).get("last_scan"), 0)
+            )
+            tokens = current_tokens[:limit]
+            selected = set(tokens)
+            if len(tokens) < limit:
+                for source in daily_sources:
+                    token = str(source["token"])
+                    if token == self._active_source_token or token in selected or token in self._browser_factory_leases:
+                        continue
+                    tokens.append(token)
+                    selected.add(token)
+                    if len(tokens) >= limit:
+                        break
+            expires_at = timestamp + BROWSER_FACTORY_LEASE_SECONDS
+            for token in tokens:
+                self._browser_factory_leases[token] = {
+                    "lease_id": lease_id, "expires_at": expires_at
+                }
+        sources = [self.database.get_source(token) for token in tokens]
+        return {
+            "lease_id": lease_id,
+            "expires_at": expires_at if tokens else 0,
+            "lease_seconds": BROWSER_FACTORY_LEASE_SECONDS,
+            "multiplier": multiplier,
+            "limit": limit,
+            "sources": [source for source in sources if source is not None],
+        }
+
+    def complete_browser_factory_lease(self, token: str, lease_id: str) -> None:
+        with self._browser_factory_lock:
+            lease = self._browser_factory_leases.get(token)
+            if lease and hmac.compare_digest(str(lease.get("lease_id") or ""), lease_id):
+                self._browser_factory_leases.pop(token, None)
+        self._mark_source_idle(token, completed=True)
+
+    def _browser_factory_leased(self, token: str) -> bool:
+        timestamp = now_ts()
+        with self._browser_factory_lock:
+            lease = self._browser_factory_leases.get(token)
+            if not lease:
+                return False
+            if safe_int(lease.get("expires_at"), 0) <= timestamp:
+                self._browser_factory_leases.pop(token, None)
+                return False
+            return True
 
     def _mark_source_started(self, token: str) -> None:
         with self._scan_state_lock:
@@ -2354,9 +3416,10 @@ class ScannerService:
                 "auto_enabled": self.ai_auto_classification_enabled,
             }
 
-    def trigger(self, reason: str = "manual") -> bool:
+    def trigger(self, reason: str = "manual", source_interval: float | None = None) -> bool:
         if self._local_ingest_lock.locked() or not self._scan_lock.acquire(blocking=False):
             return False
+        self._temporary_source_interval = source_interval
         self._begin_scan(reason)
         try:
             thread = threading.Thread(
@@ -2371,11 +3434,21 @@ class ScannerService:
             raise
         return True
 
-    def request_scan(self, reason: str = "manual") -> dict[str, Any]:
-        started = self.trigger(reason)
+    def request_scan(
+        self, reason: str = "manual", source_interval: float | None = None
+    ) -> dict[str, Any]:
+        started = self.trigger(reason, source_interval=source_interval)
         task = self.scan_task()
-        requested_kind = "proxy_only" if reason == "manual_proxy_only" else "full"
-        active_kind = "proxy_only" if task["reason"] == "manual_proxy_only" else "full"
+        requested_kind = (
+            "proxy_only" if reason == "manual_proxy_only"
+            else "pending" if reason == "manual_pending"
+            else "full"
+        )
+        active_kind = (
+            "proxy_only" if task["reason"] == "manual_proxy_only"
+            else "pending" if task["reason"] == "manual_pending"
+            else "full"
+        )
         joined = not started and task["running"] and active_kind == requested_kind
         return {
             "started": started,
@@ -2383,6 +3456,11 @@ class ScannerService:
             "busy": not started and task["running"] and not joined,
             "task": task,
         }
+
+    def active_source_interval(self, *, proxy: bool = False) -> float:
+        if self._temporary_source_interval is not None:
+            return self._temporary_source_interval
+        return self.proxy_source_interval if proxy else self.source_interval
 
     def request_submitted_source_scan(self, token: str) -> bool:
         """Queue a newly submitted public source for one server-side scan."""
@@ -2441,8 +3519,12 @@ class ScannerService:
                     matched, changed = self._scan_source(token)
                 except Exception as exc:
                     message = str(exc) or exc.__class__.__name__
-                    self.database.update_source_scan(token, status="error", error=message, count=0, scanned=True)
-                    self._publish_status("source_error", token=token, error=message)
+                    if not is_access_error(exc):
+                        archived = self._archive_platform_banned_source(token, message)
+                        self._publish_status("source_banned", token=token, error=message, archived=archived)
+                    else:
+                        self.database.update_source_scan(token, status="error", error=message, count=0, scanned=True)
+                        self._publish_status("source_error", token=token, error=message)
                     self.events.publish(
                         "source_submission", {"phase": "error", "token": token, "error": message}
                     )
@@ -2519,6 +3601,8 @@ class ScannerService:
         existing = self.database.get_product(goods_key)
         if existing is None:
             raise KeyError(goods_key)
+        if existing.get("off_shelf"):
+            raise ValueError("已下架商品不参与刷新")
         source_token = str(existing["source_token"])
         if self.is_server_refreshing_source(source_token):
             raise ProductRefreshInProgress(goods_key)
@@ -2537,9 +3621,18 @@ class ScannerService:
                     raise ValueError("该商品由 PriceAI 快照维护，请使用 PriceAI 同步")
                 base_url = str(source.get("base_url") or LDXP_BASE_URL)
                 remote_token = str(source.get("remote_token") or source["token"])
-                item = self._load_single_product(
-                    LDXPClient(base_url=base_url), existing, remote_token
-                )
+                try:
+                    item = self._load_single_product(
+                        LDXPClient(base_url=base_url), existing, remote_token
+                    )
+                except LDXPError as exc:
+                    if not is_off_shelf_error(exc):
+                        raise
+                    saved = self.database.mark_product_off_shelf(goods_key, str(exc))
+                    if saved is None:
+                        raise KeyError(goods_key)
+                    self.events.publish("product_refresh", {"change": "off_shelf", "product": saved})
+                    return "off_shelf", saved
                 product = product_from_api(
                     item,
                     source_token,
@@ -2550,10 +3643,6 @@ class ScannerService:
                     self.database.deactivate_product(goods_key)
                     self.events.publish("product_refresh_remove", {"goods_key": goods_key})
                     return "removed", None
-                raw_stock = (item.get("extend") or {}).get("stock_count")
-                if raw_stock is None:
-                    product["stock_count"] = int(existing["stock_count"])
-                    product["in_stock"] = bool(existing["in_stock"])
                 self._keep_refresh_metadata(product, existing)
                 change, saved = self.database.upsert_product(product)
                 self.events.publish(
@@ -2582,13 +3671,17 @@ class ScannerService:
 
         try:
             clean_source_name = clean_text(source_name or source.get("name") or token, 200)
+            existing_keys = {
+                str(product["goods_key"])
+                for product in self.database.list_source_products(token)
+            }
             seen: set[str] = set()
             matched = 0
             changed = 0
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                product = product_from_api(
+                product = product_from_local_scan(
                     item, token, clean_source_name, str(source.get("base_url") or LDXP_BASE_URL)
                 )
                 if product is None:
@@ -2601,9 +3694,13 @@ class ScannerService:
                 self.events.publish("product", {"change": change, "product": saved})
                 self._queue_new_ai_classification(change)
 
-            removed_keys = self.database.deactivate_missing(token, seen)
+            removed_keys = existing_keys - seen
             for goods_key in removed_keys:
-                self.events.publish("product_remove", {"goods_key": goods_key})
+                saved = self.database.mark_product_off_shelf(
+                    goods_key, "本地完整扫描未返回该商品"
+                )
+                if saved is not None:
+                    self.events.publish("product", {"change": "off_shelf", "product": saved})
             self.database.update_source_scan(
                 token,
                 status="ok",
@@ -2670,14 +3767,6 @@ class ScannerService:
                 )
                 if product is None:
                     continue
-                raw_stock = (item.get("extend") or {}).get("stock_count")
-                if (
-                    raw_stock is None
-                    and existing is not None
-                    and str(existing.get("source_token")) == token
-                ):
-                    product["stock_count"] = int(existing["stock_count"])
-                    product["in_stock"] = bool(existing["in_stock"])
                 if existing is not None:
                     self._keep_refresh_metadata(product, existing)
                 found.add(goods_key)
@@ -2687,9 +3776,14 @@ class ScannerService:
                 self.events.publish("product", {"change": change, "product": saved})
                 self._queue_new_ai_classification(change)
 
-            removed_keys = self.database.deactivate_source_products(token, requested_keys - found)
-            for goods_key in removed_keys:
-                self.events.publish("product_remove", {"goods_key": goods_key})
+            removed_keys: set[str] = set()
+            for goods_key in requested_keys - found:
+                saved = self.database.mark_product_off_shelf(
+                    goods_key, "本地刷新未返回该商品，商品可能未上架或已下架"
+                )
+                if saved is not None:
+                    removed_keys.add(goods_key)
+                    self.events.publish("product", {"change": "off_shelf", "product": saved})
             self.database.update_source_scan(
                 token,
                 status="ok",
@@ -3133,6 +4227,8 @@ class ScannerService:
             if not self._wait_for_local_ingest():
                 return
             token = str(source["token"])
+            if self._browser_factory_leased(token):
+                continue
             source_started = time.monotonic()
             self._mark_source_started(token)
             self.database.update_source_scan(token, status="scanning")
@@ -3156,16 +4252,30 @@ class ScannerService:
                 self._mark_source_idle(token)
                 return
             except LDXPError as exc:
+                if not is_access_error(exc):
+                    archived = self._archive_platform_banned_source(token, str(exc) or exc.__class__.__name__)
+                    result.succeeded += 1
+                    result.changed += archived
+                    pending.pop(token, None)
+                    self._publish_status("source_banned", token=token, archived=archived, proxy_mode="scdn")
+                    self._mark_source_idle(token, completed=True)
+                    continue
                 result.paused += 1
                 message = str(exc) or exc.__class__.__name__
                 self.database.update_source_scan(token, status="paused", error=message, count=None)
                 self._publish_status("source_paused", token=token, error=message, proxy_mode="scdn")
                 self._mark_source_idle(token)
             except Exception as exc:
-                result.failed += 1
                 message = str(exc) or exc.__class__.__name__
-                self.database.update_source_scan(token, status="error", error=message, count=None)
-                self._publish_status("source_error", token=token, error=message)
+                if not is_access_error(exc):
+                    archived = self._archive_platform_banned_source(token, message)
+                    result.succeeded += 1
+                    result.changed += archived
+                    self._publish_status("source_banned", token=token, archived=archived)
+                else:
+                    result.failed += 1
+                    self.database.update_source_scan(token, status="error", error=message, count=None)
+                    self._publish_status("source_error", token=token, error=message)
                 pending.pop(token, None)
                 self._mark_source_idle(token, completed=True)
             else:
@@ -3176,7 +4286,7 @@ class ScannerService:
                 self._mark_source_idle(token, completed=True)
             if position < len(queued) - 1:
                 delay = remaining_cycle_delay(
-                    self.proxy_source_interval, time.monotonic() - source_started
+                    self.active_source_interval(proxy=True), time.monotonic() - source_started
                 )
                 if delay and self._stop.wait(delay):
                     return
@@ -3195,6 +4305,8 @@ class ScannerService:
             if not self._wait_for_local_ingest():
                 return
             token = str(source["token"])
+            if self._browser_factory_leased(token):
+                continue
             source_started = time.monotonic()
             self._mark_source_started(token)
             self.database.update_source_scan(token, status="scanning")
@@ -3220,7 +4332,7 @@ class ScannerService:
             self._mark_source_idle(token, completed=True)
             if position < len(queued) - 1:
                 delay = remaining_cycle_delay(
-                    self.source_interval, time.monotonic() - source_started
+                    self.active_source_interval(), time.monotonic() - source_started
                 )
                 if delay and self._stop.wait(delay):
                     return
@@ -3304,7 +4416,7 @@ class ScannerService:
                         {"phase": "error", "error": str(exc) or exc.__class__.__name__},
                     )
             sources = self.database.list_sources_due_for_scan(
-                scheduled=reason == "scheduled"
+                scheduled=reason in {"scheduled", "manual_pending"}
             )
             result.source_count = len(sources)
             self._set_pending_scan_sources(sources)
@@ -3324,6 +4436,8 @@ class ScannerService:
                         break
                     source_started = time.monotonic()
                     token = str(source["token"])
+                    if self._browser_factory_leased(token):
+                        continue
                     self._mark_source_started(token)
                     self.database.update_source_scan(token, status="scanning")
                     self._publish_status(
@@ -3345,7 +4459,9 @@ class ScannerService:
                         self._mark_source_idle(token, completed=True)
                     if index < len(sources):
                         source_elapsed = time.monotonic() - source_started
-                        source_delay = remaining_cycle_delay(self.source_interval, source_elapsed)
+                        source_delay = remaining_cycle_delay(
+                            self.active_source_interval(), source_elapsed
+                        )
                         if source_delay and self._stop.wait(source_delay):
                             break
         finally:
@@ -3358,6 +4474,7 @@ class ScannerService:
             self._scan_reason = ""
             self._active_source_token = ""
             self._pending_scan_sources.clear()
+            self._temporary_source_interval = None
         if self._scan_lock.locked():
             self._scan_lock.release()
         snapshot = {
@@ -3372,6 +4489,100 @@ class ScannerService:
         self.events.publish("snapshot", snapshot)
         self._publish_status("completed", result=(result or ScanResult()).__dict__)
 
+    @staticmethod
+    def _read_public_product_link(link: str) -> None:
+        """Fetch an imported public product URL and reject clear off-shelf pages."""
+        parsed = urllib.parse.urlsplit(link)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise LDXPError("商品链接不是可访问的 HTTP(S) 地址")
+        try:
+            addresses = {
+                ipaddress.ip_address(record[4][0])
+                for record in socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+            }
+        except (socket.gaierror, ValueError) as exc:
+            raise LDXPError("商品链接域名无法解析") from exc
+        if not addresses or any(not address.is_global for address in addresses):
+            raise LDXPError("商品链接未指向公网地址")
+        request = urllib.request.Request(
+            link,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; LDXPPriceScanner/1.0)"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=LDXP_REQUEST_TIMEOUT) as response:
+                body = response.read(LDXP_LINK_CHECK_BODY_LIMIT).decode("utf-8", "ignore")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise LDXPError(f"商品链接无法获取: {exc}") from exc
+        if is_off_shelf_error(LDXPError(body)):
+            raise LDXPError("商品链接页面显示已下架")
+
+    def _scan_snapshot_source_unlocked(
+        self, token: str, client: LDXPClient | None = None
+    ) -> tuple[int, int]:
+        """Validate every imported product link; a failed read is an off-shelf product."""
+        source = self.database.get_source(token)
+        if source is None:
+            raise KeyError(token)
+        products = self.database.list_source_products(token)
+        clients: dict[str, LDXPClient] = {}
+        checked = 0
+        changed = 0
+        for existing in products:
+            if self._stop.is_set():
+                break
+            checked += 1
+            goods_key = str(existing["goods_key"])
+            previously_off_shelf = bool(existing.get("off_shelf"))
+            previous_stock = safe_int(existing.get("stock_count"), -1)
+            try:
+                reference = parse_source_reference(str(existing.get("link") or ""), allow_item=True)
+                if not reference.goods_key:
+                    raise LDXPError("商品链接缺少商品标识")
+                link_client = client
+                if link_client is None or link_client.base_url != reference.base_url:
+                    link_client = clients.setdefault(
+                        reference.base_url, LDXPClient(base_url=reference.base_url)
+                    )
+                detail = link_client.goods_info(reference.goods_key)
+                returned_key = str(detail.get("goods_key") or reference.goods_key)
+                if returned_key != reference.goods_key:
+                    raise LDXPError("商品链接返回了不匹配的商品数据")
+                saved = self.database.mark_product_link_verified(goods_key)
+                if saved is not None and (previously_off_shelf or previous_stock != -1):
+                    changed += 1
+                    self.events.publish("product", {"change": "link_verified", "product": saved})
+            except ValueError:
+                # Non-LDXP public listings still get a real page read. A failed read is off-shelf.
+                try:
+                    self._read_public_product_link(str(existing.get("link") or ""))
+                    saved = self.database.mark_product_link_verified(goods_key)
+                    if saved is not None and (previously_off_shelf or previous_stock != -1):
+                        changed += 1
+                        self.events.publish("product", {"change": "link_verified", "product": saved})
+                except Exception as exc:  # a missing public page is an off-shelf listing by policy
+                    saved = self.database.mark_product_off_shelf(goods_key, f"链接数据无法获取: {exc}")
+                    if saved is not None and not previously_off_shelf:
+                        changed += 1
+                        self.events.publish("product", {"change": "off_shelf", "product": saved})
+            except Exception as exc:  # link/API failure means the listing has been delisted
+                saved = self.database.mark_product_off_shelf(goods_key, f"链接数据无法获取: {exc}")
+                if saved is not None and not previously_off_shelf:
+                    changed += 1
+                    self.events.publish("product", {"change": "off_shelf", "product": saved})
+        self.database.update_source_scan(
+            token,
+            status="ok",
+            name=str(source.get("name") or token),
+            error="",
+            count=checked,
+            scanned=True,
+        )
+        self._publish_status(
+            "source_completed", token=token, name=str(source.get("name") or token),
+            matched=checked, changed=changed, removed=0,
+        )
+        return checked, changed
+
     def _scan_source(self, token: str, client: LDXPClient | None = None) -> tuple[int, int]:
         with self._source_lock_for(token):
             return self._scan_source_unlocked(token, client=client)
@@ -3382,8 +4593,10 @@ class ScannerService:
         source = self.database.get_source(token)
         if source is None:
             raise KeyError(token)
+        if source.get("source_kind") == "snapshot":
+            return self._scan_snapshot_source_unlocked(token, client=client)
         if source.get("source_kind") != "shop_api":
-            raise ValueError("该来源不是店铺 API 采集源")
+            raise ValueError("该来源不是支持扫描的数据源")
         base_url = str(source.get("base_url") or LDXP_BASE_URL)
         remote_token = str(source.get("remote_token") or token)
         checkpoint = self.database.get_or_create_scan_checkpoint(token)
@@ -3393,6 +4606,11 @@ class ScannerService:
         self.database.update_source_scan(token, status="scanning", name=source_name)
         changed_count = 0
         cycle_id = str(checkpoint["cycle_id"])
+        off_shelf_keys = self.database.off_shelf_product_keys(token)
+        # Keep archived listings out of this scan without allowing checkpoint cleanup
+        # to deactivate them. A user can still explicitly refresh one if it is relisted.
+        for goods_key in off_shelf_keys:
+            self.database.mark_scan_seen(token, cycle_id, goods_key)
 
         available_types = [
             goods_type
@@ -3430,6 +4648,9 @@ class ScannerService:
                 items = payload.get("list") or []
                 total = safe_int(payload.get("total"), len(items))
                 for item in items:
+                    item_key = str(item.get("goods_key") or "")
+                    if item_key in off_shelf_keys:
+                        continue
                     product = product_from_api(item, token, source_name, base_url)
                     if product is None:
                         continue
@@ -3509,15 +4730,81 @@ class AppState:
         self.database = database
         self.events = events
         self.scanner = scanner
+        self._user_refresh_claim_lock = threading.Lock()
+
+    def claim_user_refresh_batch(
+        self, payload: dict[str, Any], *, allow_lazy_refresh: bool = False
+    ) -> dict[str, Any]:
+        """Allocate the next small browser-refresh batch from a shared persisted cursor."""
+        category = clean_text(payload.get("category") or "all", 80)
+        valid_categories = {"all", *(item["key"] for item in PRODUCT_CATEGORY_DEFINITIONS)}
+        if category not in valid_categories:
+            raise ValueError("分类无效")
+        sort = clean_text(payload.get("sort") or "price", 20)
+        if sort not in {"price", "stock", "updated"}:
+            sort = "price"
+        scope = {
+            "category": category,
+            "stock_only": bool(payload.get("stock_only", True)),
+            "search": clean_text(payload.get("search"), 500),
+            "min_price": max(0.0, safe_float(payload.get("min_price"))),
+            "max_price": payload.get("max_price"),
+            "include_left": bool(payload.get("include_left")),
+            "sort": sort,
+            "rating_sort": bool(payload.get("rating_sort")),
+        }
+        if scope["max_price"] in {"", None}:
+            scope["max_price"] = None
+        else:
+            scope["max_price"] = max(0.0, safe_float(scope["max_price"]))
+        scope_key = hashlib.sha256(
+            json.dumps(scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:32]
+        setting_key = f"user_refresh_anchor:{scope_key}"
+        with self._user_refresh_claim_lock:
+            # A successful refresh advances last_seen, so always taking the oldest
+            # rows naturally drains never-refreshed/stale products before revisiting
+            # anything this browser refresh lane has just scanned.
+            offset = 0
+            page = self.database.list_product_page(
+                category=category,
+                stock_only=bool(scope["stock_only"]),
+                search=str(scope["search"]),
+                sort=sort,
+                min_price=float(scope["min_price"]),
+                max_price=scope["max_price"],
+                include_left=bool(scope["include_left"]),
+                rating_sort=bool(scope["rating_sort"]),
+                exclude_lazy_refresh=not allow_lazy_refresh,
+                oldest_seen_first=True,
+                offset=offset,
+                limit=24,
+            )
+            total = int(page["total"])
+            products = page["products"]
+            next_offset = offset + len(products)
+            self.database.set_settings({setting_key: str(next_offset)})
+        return {
+            "products": products,
+            "total": total,
+            "offset": offset,
+            "next_offset": next_offset,
+            "limit": 24,
+            "scope": scope_key,
+        }
 
     def snapshot(self, include_products: bool = False) -> dict[str, Any]:
         payload = {
             "stats": self.database.stats(),
             "catalog_revision": self.database.catalog_revision(),
             "sources": self.database.list_sources(),
-            "categories": [{"key": item["key"], "label": item["label"]} for item in CATEGORY_DEFINITIONS],
+            "categories": [
+                {"key": item["key"], "label": item["label"]}
+                for item in PRODUCT_CATEGORY_DEFINITIONS
+            ],
             "scanning": self.scanner.scanning,
             "scan_task": self.scanner.scan_task(),
+            "sponsored_update": self.scanner.sponsored_update_status(),
             "ai_classification": self.scanner.ai_classification_status(),
             "last_started": self.scanner.last_started,
             "last_completed": self.scanner.last_completed,
@@ -3525,7 +4812,7 @@ class AppState:
             "scan_interval": self.scanner.interval,
             "discovery_interval": DISCOVERY_INTERVAL,
             "auto_scan_enabled": self.scanner.auto_scan_enabled,
-            "source_interval": self.scanner.source_interval,
+            "source_interval": self.scanner.active_source_interval(),
             "page_size": LDXP_PAGE_SIZE,
             "failover_proxy_enabled": bool(LDXP_FAILOVER_PROXY_URL),
             "scdn_proxy_pool": {
@@ -3578,6 +4865,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _optional_admin(self) -> bool:
+        supplied = self.headers.get("X-LDXP-Admin-Key", "")
+        if not supplied:
+            return False
+        if not LDXP_ADMIN_KEY or not hmac.compare_digest(supplied, LDXP_ADMIN_KEY):
+            raise PermissionError("Invalid administrator token.")
+        return True
+
     def _read_json(self, max_bytes: int = 1024 * 1024) -> dict[str, Any]:
         length = safe_int(self.headers.get("Content-Length"), 0)
         if length <= 0:
@@ -3591,6 +4886,68 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ValueError("请求体必须是对象")
         return payload
+
+    @staticmethod
+    def _comment_goods_key(path: str, suffix: str) -> str:
+        prefix = "/api/products/"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return ""
+        goods_key = urllib.parse.unquote(path[len(prefix) : -len(suffix)]).strip()
+        if not goods_key or "/" in goods_key or len(goods_key) > 200:
+            raise ValueError("Invalid product identifier.")
+        return goods_key
+
+    @staticmethod
+    def _save_comment_images(raw_images: Any) -> list[str]:
+        if raw_images is None:
+            return []
+        if not isinstance(raw_images, list) or len(raw_images) > COMMENT_MAX_IMAGES:
+            raise ValueError("A comment may contain up to 4 images.")
+        COMMENT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        saved: list[str] = []
+        try:
+            for raw_image in raw_images:
+                if not isinstance(raw_image, str) or not raw_image.startswith("data:image/jpeg;base64,"):
+                    raise ValueError("Images must be browser-compressed JPEG files.")
+                encoded = raw_image.split(",", 1)[1]
+                try:
+                    image = base64.b64decode(encoded, validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise ValueError("Invalid comment image.") from exc
+                if len(image) < 4 or len(image) > COMMENT_IMAGE_MAX_BYTES or not image.startswith(b"\xff\xd8\xff"):
+                    raise ValueError("Each JPEG image must be smaller than 900 KB.")
+                name = f"comment-{uuid.uuid4().hex}.jpg"
+                target = COMMENT_IMAGE_DIR / name
+                target.write_bytes(image)
+                saved.append(name)
+            return saved
+        except Exception:
+            for name in saved:
+                try:
+                    (COMMENT_IMAGE_DIR / name).unlink()
+                except OSError:
+                    pass
+            raise
+
+    @staticmethod
+    def _save_comment_avatar(raw_avatar: Any) -> str:
+        if raw_avatar is None or raw_avatar == "":
+            return ""
+        if not isinstance(raw_avatar, str) or not raw_avatar.startswith("data:image/jpeg;base64,"):
+            raise ValueError("Avatar must be a browser-compressed JPEG file.")
+        try:
+            image = base64.b64decode(raw_avatar.split(",", 1)[1], validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Invalid avatar image.") from exc
+        if len(image) < 4 or len(image) > COMMENT_AVATAR_MAX_BYTES or not image.startswith(b"\xff\xd8\xff"):
+            raise ValueError("The avatar image must be smaller than 100 KB.")
+        COMMENT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        name = f"avatar-{uuid.uuid4().hex}.jpg"
+        try:
+            (COMMENT_IMAGE_DIR / name).write_bytes(image)
+        except OSError as exc:
+            raise ValueError("Unable to save avatar image.") from exc
+        return name
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -3621,6 +4978,55 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "catalog_revision": self.app.database.catalog_revision(),
                 }
             )
+        elif path == "/api/comments/previews":
+            keys = urllib.parse.parse_qs(parsed.query, keep_blank_values=False).get("key", [])
+            cleaned = list(
+                dict.fromkeys(clean_text(key, 200) for key in keys if clean_text(key, 200))
+            )
+            if len(cleaned) > PRODUCT_STREAM_MAX_LIMIT:
+                self._error(HTTPStatus.BAD_REQUEST, "too many product keys")
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "previews": self.app.database.comment_previews(cleaned),
+                    "metrics": self.app.database.comment_metrics(cleaned),
+                }
+            )
+        elif path.startswith("/api/products/") and path.endswith("/comments"):
+            try:
+                goods_key = self._comment_goods_key(path, "/comments")
+                if self.app.database.get_product(goods_key) is None:
+                    self._error(HTTPStatus.NOT_FOUND, "Product not found.")
+                    return
+                request_query = urllib.parse.parse_qs(parsed.query)
+                limit = safe_int(request_query.get("limit", ["100"])[0], 100)
+                after = safe_int(request_query.get("after", ["0"])[0], 0)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "comments": self.app.database.comments(goods_key, limit, after),
+                        "metrics": self.app.database.comment_metrics([goods_key])[goods_key],
+                    }
+                )
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        elif path.startswith("/api/comment-images/"):
+            image_name = Path(urllib.parse.unquote(path.removeprefix("/api/comment-images/"))).name
+            if not re.fullmatch(r"(?:comment|avatar)-[0-9a-f]{32}\.jpg", image_name):
+                self._error(HTTPStatus.NOT_FOUND, "Image not found.")
+                return
+            try:
+                body = (COMMENT_IMAGE_DIR / image_name).read_bytes()
+            except OSError:
+                self._error(HTTPStatus.NOT_FOUND, "Image not found.")
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif path == "/api/events":
             self._serve_events()
         elif path.startswith("/api/products/") and path.endswith("/refresh-status"):
@@ -3643,6 +5049,159 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/api/products/") and path.endswith("/comments"):
+            saved_images: list[str] = []
+            saved_avatar = ""
+            try:
+                is_admin = self._optional_admin()
+                goods_key = self._comment_goods_key(path, "/comments")
+                payload = self._read_json(max_bytes=5 * 1024 * 1024)
+                author = clean_text(payload.get("author"), 40) or "Anonymous"
+                body = clean_text(payload.get("body"), 200)
+                raw_scores = payload.get("scores") or {}
+                if not isinstance(raw_scores, dict):
+                    raise ValueError("Scores must be an object.")
+                scores: dict[str, float | None] = {}
+                for key in ("product_score", "shop_score", "experience_score"):
+                    raw_score = raw_scores.get(key)
+                    if raw_score is None or raw_score == "":
+                        scores[key] = None
+                        continue
+                    try:
+                        score = float(raw_score)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("Scores must be between 0 and 5.") from exc
+                    if not math.isfinite(score) or score < 0 or score > 5:
+                        raise ValueError("Scores must be between 0 and 5.")
+                    scores[key] = round(score, 1)
+                saved_avatar = self._save_comment_avatar(payload.get("avatar"))
+                saved_images = self._save_comment_images(payload.get("images"))
+                if not body and not saved_images and not any(score is not None for score in scores.values()):
+                    raise ValueError("Write a comment or attach an image.")
+                comment = self.app.database.add_comment(
+                    goods_key, author, saved_avatar, body, saved_images, scores, is_admin
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "comment": comment,
+                        "metrics": self.app.database.comment_metrics([goods_key])[goods_key],
+                    },
+                    HTTPStatus.CREATED,
+                )
+            except ValueError as exc:
+                if saved_avatar:
+                    try:
+                        (COMMENT_IMAGE_DIR / saved_avatar).unlink()
+                    except OSError:
+                        pass
+                for name in saved_images:
+                    try:
+                        (COMMENT_IMAGE_DIR / name).unlink()
+                    except OSError:
+                        pass
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            except KeyError:
+                if saved_avatar:
+                    try:
+                        (COMMENT_IMAGE_DIR / saved_avatar).unlink()
+                    except OSError:
+                        pass
+                for name in saved_images:
+                    try:
+                        (COMMENT_IMAGE_DIR / name).unlink()
+                    except OSError:
+                        pass
+                self._error(HTTPStatus.NOT_FOUND, "Product not found.")
+            except PermissionError as exc:
+                self._error(HTTPStatus.FORBIDDEN, str(exc))
+            return
+        pin_prefix = "/api/products/"
+        pin_marker = "/comments/"
+        if path.startswith(pin_prefix) and pin_marker in path and path.endswith("/verify"):
+            if not self._require_admin():
+                return
+            try:
+                stem = path[len(pin_prefix) : -len("/verify")]
+                encoded_key, comment_id = stem.split(pin_marker, 1)
+                goods_key = urllib.parse.unquote(encoded_key).strip()
+                if not goods_key or "/" in goods_key or not re.fullmatch(r"[0-9a-f]{32}", comment_id):
+                    raise ValueError("Invalid comment identifier.")
+                payload = self._read_json()
+                verified = payload.get("verified")
+                if not isinstance(verified, bool):
+                    raise ValueError("verified must be true or false.")
+                if not self.app.database.set_comment_verified(goods_key, comment_id, verified):
+                    self._error(HTTPStatus.NOT_FOUND, "Comment not found.")
+                    return
+                self._send_json({"ok": True, "id": comment_id, "verified": verified})
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path.startswith(pin_prefix) and pin_marker in path and path.endswith("/replies"):
+            try:
+                is_admin = self._optional_admin()
+                stem = path[len(pin_prefix) : -len("/replies")]
+                encoded_key, comment_id = stem.split(pin_marker, 1)
+                goods_key = urllib.parse.unquote(encoded_key).strip()
+                if not goods_key or "/" in goods_key or not re.fullmatch(r"[0-9a-f]{32}", comment_id):
+                    raise ValueError("Invalid comment identifier.")
+                payload = self._read_json()
+                author = clean_text(payload.get("author"), 40) or ("Administrator" if is_admin else "Anonymous")
+                body = clean_text(payload.get("body"), 200)
+                if not body:
+                    raise ValueError("Reply text is required.")
+                reply = self.app.database.add_comment_reply(goods_key, comment_id, author, body, is_admin)
+                if reply is None:
+                    self._error(HTTPStatus.NOT_FOUND, "Comment not found.")
+                    return
+                self._send_json({"ok": True, "reply": reply}, HTTPStatus.CREATED)
+            except PermissionError as exc:
+                self._error(HTTPStatus.FORBIDDEN, str(exc))
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path.startswith(pin_prefix) and pin_marker in path and path.endswith("/vote"):
+            try:
+                stem = path[len(pin_prefix) : -len("/vote")]
+                encoded_key, comment_id = stem.split(pin_marker, 1)
+                goods_key = urllib.parse.unquote(encoded_key).strip()
+                if not goods_key or "/" in goods_key or len(goods_key) > 200 or not re.fullmatch(r"[0-9a-f]{32}", comment_id):
+                    raise ValueError("Invalid comment identifier.")
+                payload = self._read_json()
+                voter_key = clean_text(payload.get("voter_key"), 80)
+                value = safe_int(payload.get("value"), 0)
+                if not re.fullmatch(r"[0-9a-f-]{16,80}", voter_key) or value not in {-1, 1}:
+                    raise ValueError("Invalid vote.")
+                vote = self.app.database.vote_comment(goods_key, comment_id, voter_key, value)
+                if vote is None:
+                    self._error(HTTPStatus.NOT_FOUND, "Comment not found.")
+                    return
+                self._send_json({"ok": True, "vote": vote})
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path.startswith(pin_prefix) and pin_marker in path and path.endswith("/pin"):
+            if not self._require_admin():
+                return
+            try:
+                stem = path[len(pin_prefix) : -len("/pin")]
+                encoded_key, comment_id = stem.split(pin_marker, 1)
+                goods_key = urllib.parse.unquote(encoded_key).strip()
+                if not goods_key or "/" in goods_key or len(goods_key) > 200 or not re.fullmatch(r"[0-9a-f]{32}", comment_id):
+                    raise ValueError("Invalid comment identifier.")
+                payload = self._read_json()
+                pinned = payload.get("pinned")
+                if not isinstance(pinned, bool):
+                    raise ValueError("pinned must be true or false.")
+                comment = self.app.database.set_comment_pinned(goods_key, comment_id, pinned)
+                if comment is None:
+                    self._error(HTTPStatus.NOT_FOUND, "Comment not found.")
+                    return
+                self._send_json({"ok": True, "comment": comment})
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         priceai_refresh_prefix = "/api/products/"
         priceai_refresh_suffix = "/priceai-refresh"
         if path.startswith(priceai_refresh_prefix) and path.endswith(priceai_refresh_suffix):
@@ -3661,6 +5220,56 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"ok": True, "admin": True})
             return
+        if path == "/api/sponsored-update/start":
+            if not self._require_admin():
+                return
+            status = self.app.scanner.sponsored_update_status()
+            prepared = False
+            if not safe_int(status.get("total"), 0):
+                status = self.app.scanner.prepare_sponsored_updates()
+                prepared = True
+            request = self.app.scanner.start_sponsored_updates()
+            self._send_json(
+                {
+                    "ok": True,
+                    "prepared": prepared,
+                    **request,
+                    "message": (
+                        "赞助更新队列为空，未找到待更新店铺"
+                        if not safe_int(request.get("total"), 0)
+                        else "赞助更新已开始，服务器将逐店刷新"
+                        if request.get("started")
+                        else "赞助更新正在执行，已显示实时进度"
+                        if request.get("joined")
+                        else "服务器正在执行其他扫描，请稍后继续"
+                    ),
+                },
+                HTTPStatus.ACCEPTED,
+            )
+            return
+        if path == "/api/sponsored-update/prepare":
+            if not self._require_admin():
+                return
+            try:
+                status = self.app.scanner.prepare_sponsored_updates()
+            except RuntimeError as exc:
+                self._error(HTTPStatus.CONFLICT, str(exc))
+                return
+            self._send_json({"ok": True, **status})
+            return
+        if path == "/api/sponsored-update/stop":
+            if not self._require_admin():
+                return
+            request = self.app.scanner.stop_sponsored_updates()
+            self._send_json(
+                {
+                    "ok": True,
+                    **request,
+                    "message": "将于当前店铺请求结束后停止" if request["stopping"] else "赞助更新当前未运行",
+                },
+                HTTPStatus.ACCEPTED,
+            )
+            return
         if path == "/api/discover":
             if not self._require_admin():
                 return
@@ -3677,7 +5286,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/scan":
             if not self._require_admin():
                 return
-            request = self.app.scanner.request_scan("manual")
+            try:
+                payload = self._read_json()
+                temporary_interval = payload.get("source_interval")
+                if temporary_interval is not None:
+                    temporary_interval = float(temporary_interval)
+                    if temporary_interval < 0 or temporary_interval > 3600:
+                        raise ValueError("临时来源间隔必须在 0 到 3600 秒之间")
+            except (TypeError, ValueError) as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            request = self.app.scanner.request_scan(
+                "manual", source_interval=temporary_interval
+            )
             self._send_json(
                 {
                     "ok": True,
@@ -3690,6 +5311,37 @@ class RequestHandler(BaseHTTPRequestHandler):
                         else "服务器正在执行另一类扫描，请等待当前任务结束"
                         if request["busy"]
                         else "当前有用户刷新任务，服务器全量扫描暂未启动"
+                    ),
+                },
+                HTTPStatus.ACCEPTED,
+            )
+            return
+        if path == "/api/scan/pending":
+            if not self._require_admin():
+                return
+            try:
+                payload = self._read_json()
+                temporary_interval = payload.get("source_interval")
+                if temporary_interval is not None:
+                    temporary_interval = float(temporary_interval)
+                    if temporary_interval < 0 or temporary_interval > 3600:
+                        raise ValueError("临时来源间隔必须在 0 到 3600 秒之间")
+            except (TypeError, ValueError) as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            request = self.app.scanner.request_scan(
+                "manual_pending", source_interval=temporary_interval
+            )
+            self._send_json(
+                {
+                    "ok": True,
+                    **request,
+                    "message": (
+                        "待更新来源扫描已启动"
+                        if request["started"]
+                        else "待更新来源扫描正在进行中"
+                        if request["joined"]
+                        else "服务器正在执行其他扫描任务"
                     ),
                 },
                 HTTPStatus.ACCEPTED,
@@ -3736,6 +5388,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/classify":
             self._error(HTTPStatus.GONE, "AI classification is disabled")
             return
+        if path == "/api/user-refresh/claim":
+            try:
+                payload = self._read_json()
+                batch = self.app.claim_user_refresh_batch(
+                    payload, allow_lazy_refresh=self._optional_admin()
+                )
+                self._send_json({"ok": True, **batch})
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/browser-factory/claim":
+            payload = self._read_json()
+            batch = self.app.scanner.claim_browser_factory_batch(payload.get("multiplier", 1))
+            self._send_json({"ok": True, **batch})
+            return
         if path == "/api/local-scan/source":
             try:
                 payload = self._read_json(max_bytes=8 * 1024 * 1024)
@@ -3752,6 +5419,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("source_name") or token),
                     items,
                 )
+                lease_id = str(payload.get("lease_id") or "")
+                if lease_id:
+                    self.app.scanner.complete_browser_factory_lease(token, lease_id)
                 self._send_json({"ok": True, **result})
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc))
@@ -3884,7 +5554,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "ok": True,
                         "auto_scan_enabled": enabled,
                         "scan_interval": interval,
-                        "source_interval": self.app.scanner.source_interval,
+                        "source_interval": self.app.scanner.active_source_interval(),
                     }
                 )
             except ValueError as exc:
@@ -3958,7 +5628,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return values[-1] if values else default
 
         category = query_value("category", "all")
-        allowed_categories = {"all", *(item["key"] for item in CATEGORY_DEFINITIONS)}
+        allowed_categories = {"all", *(item["key"] for item in PRODUCT_CATEGORY_DEFINITIONS)}
         if category not in allowed_categories:
             self._error(HTTPStatus.BAD_REQUEST, "商品分类无效")
             return
@@ -3973,6 +5643,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             "false",
             "no",
             "off",
+        }
+        rating_sort = query_value("rating_sort", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
         }
         try:
             min_price = parse_price_filter(
@@ -4010,6 +5686,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             min_price=min_price,
             max_price=max_price,
             include_left=include_left,
+            rating_sort=rating_sort,
             offset=offset,
             limit=limit,
         )
@@ -4112,6 +5789,7 @@ def create_app(db_path: Path | str = DB_PATH, seed: bool = True) -> AppState:
 
 def main() -> None:
     global APP_STATE
+    COMMENT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     APP_STATE = create_app()
     server = ScannerHTTPServer((HOST, PORT), RequestHandler)
 

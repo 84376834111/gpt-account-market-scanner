@@ -24,6 +24,7 @@ const state = {
   sort: 'price',
   scanning: false,
   scanTask: { running: false, reason: '', current_source: '', pending_sources: 0 },
+  sponsoredUpdate: { total: 0, completed: 0, pending: 0, running: false, next_position: 0, current_token: '', last_error: '' },
   localScanning: false,
   localScanTarget: '',
   autoScanEnabled: false,
@@ -37,6 +38,7 @@ const state = {
   renderQueued: false,
   history: [],
   historyMode: 'price',
+  historyGranularity: 'hour',
   adminVerified: false,
   serverFullScanStarting: false,
   proxyOnlyScanStarting: false,
@@ -44,33 +46,49 @@ const state = {
   priceaiSyncStarting: false,
   priceaiSyncing: false,
   submittedSourceToken: '',
+  commentPreviews: new Map(),
+  commentCarouselIndex: new Map(),
+  commentMetrics: new Map(),
+  ratingSort: false,
+  commentDrawer: { goodsKey: '', comments: new Map(), images: [], quickImages: [], avatar: null },
 };
+const commentVoterKey = (() => { const existing = localStorage.getItem('ldxp-comment-voter'); if (existing) return existing; const key = crypto.randomUUID?.() || `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`; localStorage.setItem('ldxp-comment-voter', key); return key; })();
 
 const $ = (selector) => document.querySelector(selector);
 let searchReloadTimer = 0;
 let nextLocalRequestAt = 0;
 const LOCAL_REQUEST_COOLDOWN_MS = 1000;
 const PRODUCT_CACHE_TTL_MS = 30 * 60_000;
+const REGULAR_USER_REFRESH_LIMIT = 24;
 const elements = {
   grid: $('#productGrid'), empty: $('#emptyState'), tabs: $('#categoryTabs'),
   total: $('#totalStat'), stock: $('#stockStat'), low: $('#lowStat'), source: $('#sourceStat'),
   sourceSub: $('#sourceStatSub'), result: $('#resultCount'), lastUpdate: $('#lastUpdate'),
   scanPulse: $('#scanPulse'), scanText: $('#scanStateText'),
   localScanButton: $('#localScanButton'), localScanLabel: $('#localScanButton .local-scan-label'),
-  filteredLocalScanButton: $('#filteredLocalScanButton'), filteredScanLabel: $('#filteredLocalScanButton .filtered-scan-label'),
+  browserFactoryButton: $('#browserFactoryButton'), browserFactoryLabel: $('#browserFactoryButton .browser-factory-label'),
+  browserFactoryMultiplier: $('#browserFactoryMultiplier'),
+  browserFactoryStatus: $('#browserFactoryStatus'),
   adminTokenInput: $('#adminTokenInput'), adminTokenVerifyButton: $('#adminTokenVerifyButton'),
   adminFullScanButton: $('#adminFullScanButton'),
+  sponsoredUpdateButton: $('#sponsoredUpdateButton'),
   adminProxyScanButton: $('#adminProxyScanButton'),
   priceaiSyncButton: $('#priceaiSyncButton'),
   scanDetail: $('#scanDetail'), stream: $('#streamStatus'), dialog: $('#sourceDialog'),
   sourceList: $('#sourceList'), sourceInput: $('#sourceInput'), toast: $('#toast'),
   historyDialog: $('#historyDialog'), historyTitle: $('#historyTitle'), historyShop: $('#historyShop'),
   historyToken: $('#historyToken'), historySummary: $('#historySummary'), historyChart: $('#historyChart'),
-  historyModes: $('#historyModes'),
+  historyModes: $('#historyModes'), historyGranularity: $('#historyGranularity'),
   priceMin: $('#priceMin'), priceMax: $('#priceMax'), includeMinPrice: $('#includeMinPrice'),
   loadMore: $('#loadMoreProducts'), loadMoreButton: $('#loadMoreButton'),
   loadBatchSize: $('#loadBatchSize'), loadMoreStatus: $('#loadMoreStatus'),
   sourceImportProgress: $('#sourceImportProgress'), sourceImportProgressText: $('#sourceImportProgressText'),
+  ratingSort: $('#ratingSort'), commentDialog: $('#commentDialog'), commentDialogTitle: $('#commentDialogTitle'),
+  commentDialogProduct: $('#commentDialogProduct'), commentMetric: $('#commentMetric'), commentRefreshButton: $('#commentRefreshButton'),
+  commentCloseButton: $('#commentCloseButton'), drawerCommentList: $('#drawerCommentList'), drawerCommentForm: $('#drawerCommentForm'),
+  drawerAdminToken: $('#drawerAdminToken'), drawerAdminVerify: $('#drawerAdminVerify'), drawerAdminState: $('#drawerAdminState'),
+  drawerCommentAuthor: $('#drawerCommentAuthor'), drawerCommentBody: $('#drawerCommentBody'), drawerCommentAvatar: $('#drawerCommentAvatar'), drawerAvatarPreview: $('#drawerAvatarPreview'), drawerCommentImages: $('#drawerCommentImages'), drawerImagePreview: $('#drawerImagePreview'),
+  quickCommentDialog: $('#quickCommentDialog'), quickCommentForm: $('#quickCommentForm'), quickCommentBody: $('#quickCommentBody'), quickCommentImages: $('#quickCommentImages'), quickImagePreview: $('#quickImagePreview'),
 };
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
@@ -140,6 +158,7 @@ async function loadState() {
     state.catalogRevision = Number(payload.catalog_revision || 0);
     state.scanning = Boolean(payload.scanning);
     state.scanTask = payload.scan_task || { running: state.scanning };
+    state.sponsoredUpdate = payload.sponsored_update || state.sponsoredUpdate;
     state.autoScanEnabled = Boolean(payload.auto_scan_enabled);
     state.scanIntervalMinutes = Math.max(1, Math.round(Number(payload.scan_interval || 900) / 60));
     state.sourceInterval = Number(payload.source_interval || 15);
@@ -217,8 +236,15 @@ function updateTabCounts() {
 
 function productMatchesFilters(product) {
   if (!product?.active) return false;
-  if (state.selectedCategory !== 'all' && !(product.tags || []).includes(state.selectedCategory)) return false;
-  if (state.stockOnly && !product.in_stock) return false;
+  if (state.selectedCategory === 'platform_banned') {
+    if (!product.platform_banned) return false;
+  } else if (state.selectedCategory === 'off_shelf') {
+    if (!product.off_shelf) return false;
+  } else {
+    if (product.off_shelf || product.platform_banned) return false;
+    if (state.selectedCategory !== 'all' && !(product.tags || []).includes(state.selectedCategory)) return false;
+  }
+  if (state.stockOnly && !['off_shelf', 'platform_banned'].includes(state.selectedCategory) && !product.in_stock) return false;
   const price = Number(product.price);
   if (!Number.isFinite(price)) return false;
   if (state.includeMinPrice ? price < state.minPrice : price <= state.minPrice) return false;
@@ -245,15 +271,29 @@ function filteredProducts() {
 function currentProductQuery(limit, offset) {
   return new URLSearchParams({
     category: state.selectedCategory,
-    stock_only: state.stockOnly ? '1' : '0',
+    stock_only: ['off_shelf', 'platform_banned'].includes(state.selectedCategory) ? '0' : (state.stockOnly ? '1' : '0'),
     min_price: String(state.minPrice),
     max_price: state.maxPrice === null ? '' : String(state.maxPrice),
     include_min: state.includeMinPrice ? '1' : '0',
     search: state.search.trim(),
     sort: state.sort,
+    rating_sort: state.ratingSort ? '1' : '0',
     limit: String(limit),
     offset: String(offset),
   });
+}
+
+function currentUserRefreshScope() {
+  return {
+    category: state.selectedCategory,
+    stock_only: ['off_shelf', 'platform_banned'].includes(state.selectedCategory) ? false : state.stockOnly,
+    min_price: state.minPrice,
+    max_price: state.maxPrice,
+    include_left: state.includeMinPrice,
+    search: state.search.trim(),
+    sort: state.sort,
+    rating_sort: state.ratingSort,
+  };
 }
 
 function currentFilterMappingKey() {
@@ -355,6 +395,7 @@ function flushStreamedProducts() {
     }
   }
   elements.grid.appendChild(fragment);
+  void loadCommentPreviews([...elements.grid.children].map((card) => card.dataset.key));
   updateProductLoadingControls();
 }
 
@@ -489,6 +530,7 @@ function sortCompletedFilterMapping() {
   const fragment = document.createDocumentFragment();
   for (const product of products) fragment.appendChild(createProductCard(product));
   elements.grid.replaceChildren(fragment);
+  void loadCommentPreviews(products.map((product) => product.goods_key));
   updateVisibleSummary();
 }
 
@@ -496,13 +538,48 @@ function productTags(product) {
   const labels = new Map(state.categories.map((category) => [category.key, category.label]));
   const tagHtml = (product.tags || []).map((tag) => `<span class="tag">${escapeHtml(labels.get(tag) || tag)}</span>`).join('');
   const stockClass = product.in_stock ? 'stock' : 'out';
-  const stockLabel = product.stock_count < 0 ? '库存未知' : product.in_stock ? `库存 ${product.stock_count}` : '已缺货';
-  return `${tagHtml}<span class="tag ${stockClass}">${stockLabel}</span>`;
+  const stockLabel = product.off_shelf ? '已下架' : product.stock_count < 0 ? '库存未知' : product.in_stock ? `库存 ${product.stock_count}` : '已缺货';
+  const lazy = !product.off_shelf && (Boolean(product.platform_banned) || (Number(product.stock_count) === 0
+    && Number(product.out_of_stock_since || 0) > 0
+    && Date.now() / 1000 - Number(product.out_of_stock_since) >= 24 * 60 * 60));
+  return `${tagHtml}<span class="tag ${stockClass}">${stockLabel}</span>${lazy ? '<span class="tag lazy-refresh" title="连续缺货满一天的商品由服务器每日复查">极懒更新 · 每日</span>' : ''}`;
 }
 
 function marketPrice(product) {
   return Number(product.market_price) > Number(product.price)
     ? `<div class="market-price">参考 ¥${money(product.market_price)}</div>` : '';
+}
+
+function commentPreviewHtml(goodsKey) {
+  const comments = state.commentPreviews.get(goodsKey) || [];
+  if (!comments.length) return '<span class="comment-preview-empty">暂无评论，等待评论…</span>';
+  const index = state.commentCarouselIndex.get(goodsKey) || 0;
+  const comment = comments[index % comments.length];
+  const text = String(comment.body || '').trim() || '图片评论';
+  const image = comment.images?.[0]
+    ? `<img class="comment-preview-image" src="${escapeHtml(comment.images[0])}" alt="" loading="lazy">` : '';
+  return `${image}<span class="comment-preview-label">评论${comments.length > 1 ? ` ${index % comments.length + 1}/${comments.length}` : ''}</span><span class="comment-preview-text">${escapeHtml(text)}</span><span class="comment-votes"><button type="button" data-comment-vote="1" data-comment-id="${escapeHtml(comment.id)}">👍 ${Number(comment.upvotes || 0)}</button><button type="button" data-comment-vote="-1" data-comment-id="${escapeHtml(comment.id)}">👎 ${Number(comment.downvotes || 0)}</button></span>`;
+}
+
+function updateCommentPreview(goodsKey) {
+  const card = findProductCard(goodsKey);
+  const preview = card?.querySelector('.comment-carousel');
+  if (preview) preview.innerHTML = commentPreviewHtml(goodsKey);
+}
+
+async function loadCommentPreviews(goodsKeys) {
+  const keys = [...new Set(goodsKeys)].filter(Boolean);
+  if (!keys.length) return;
+  const params = new URLSearchParams(); keys.forEach((key) => params.append('key', key));
+  try {
+    const payload = await api(`api/comments/previews?${params}`);
+    Object.entries(payload.previews || {}).forEach(([key, comments]) => {
+      state.commentPreviews.set(key, comments || []);
+      if (!state.commentCarouselIndex.has(key)) state.commentCarouselIndex.set(key, 0);
+      updateCommentPreview(key);
+    });
+    Object.entries(payload.metrics || {}).forEach(([key, metric]) => state.commentMetrics.set(key, metric));
+  } catch (error) { console.warn('Unable to load comment previews:', error); }
 }
 
 function productCard(product, index) {
@@ -513,12 +590,12 @@ function productCard(product, index) {
   return `<article class="product-card${refreshing ? ' product-refreshing' : ''}" data-key="${escapeHtml(product.goods_key)}">
     <a class="product-card-link" href="${escapeHtml(product.link)}" target="_blank" rel="noopener noreferrer" aria-label="查看 ${escapeHtml(product.name)}"></a>
     <button class="product-history" type="button" title="查看价格走势" aria-label="查看 ${escapeHtml(product.name)} 的价格走势"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 17 5-6 4 3 7-9"/></svg></button>
-    <button class="product-refresh" type="button" title="只刷新这个商品" aria-label="只刷新 ${escapeHtml(product.name)}" aria-busy="${refreshing}" ${refreshing ? 'disabled' : ''}><span aria-hidden="true">↻</span></button>
+    <button class="product-refresh" type="button" title="${product.off_shelf ? '已下架商品不更新' : '只刷新这个商品'}" aria-label="只刷新 ${escapeHtml(product.name)}" aria-busy="${refreshing}" ${refreshing || product.off_shelf ? 'disabled' : ''}><span aria-hidden="true">↻</span></button>
     <div class="product-head">${image}<div class="product-title">
       <span class="product-title-link">${escapeHtml(product.name)}</span>
       <div class="shop-line">${escapeHtml(product.source_name || product.source_token)} · ${escapeHtml(product.category_name || product.goods_type)}</div>
     </div></div>
-    <div class="tags">${productTags(product)}</div>
+    <div class="tags"><div class="product-tag-list">${productTags(product)}</div><div class="comment-card-actions"><button type="button" class="comment-area-button">评论区</button><button type="button" class="comment-refresh-button">更新</button></div></div><div class="comment-carousel" role="button" tabindex="0" title="查看商品评论" aria-label="查看 ${escapeHtml(product.name)} 的评论">${commentPreviewHtml(product.goods_key)}</div>
     <div class="price-row"><div class="price-block"><div class="price">${money(product.price)}</div><div class="market-slot">${marketPrice(product)}</div></div>
       <div class="product-meta"><span class="stock-number">${escapeHtml(product.source_token)}</span><span class="updated">${relativeTime(product.last_seen)}</span></div>
     </div>
@@ -543,11 +620,13 @@ function updateProductCard(card, product) {
   if (title.textContent !== product.name) title.textContent = product.name;
   const refreshButton = card.querySelector('.product-refresh');
   refreshButton.setAttribute('aria-label', `只刷新 ${product.name}`);
+  refreshButton.title = product.off_shelf ? '已下架商品不更新' : '只刷新这个商品';
+  refreshButton.disabled = Boolean(product.off_shelf) || state.refreshingProducts.has(product.goods_key);
   card.querySelector('.product-history').setAttribute('aria-label', `查看 ${product.name} 的价格走势`);
   const shop = card.querySelector('.shop-line');
   const shopText = `${product.source_name || product.source_token} · ${product.category_name || product.goods_type}`;
   if (shop.textContent !== shopText) shop.textContent = shopText;
-  card.querySelector('.tags').innerHTML = productTags(product);
+  card.querySelector('.product-tag-list').innerHTML = productTags(product);
   const price = card.querySelector('.price');
   const priceText = money(product.price);
   if (price.textContent !== priceText) price.textContent = priceText;
@@ -563,7 +642,7 @@ function setProductRefreshing(goodsKey, refreshing) {
   if (!card) return;
   card.classList.toggle('product-refreshing', refreshing);
   const button = card.querySelector('.product-refresh');
-  button.disabled = refreshing;
+  button.disabled = refreshing || Boolean(state.products.get(goodsKey)?.off_shelf);
   button.setAttribute('aria-busy', String(refreshing));
 }
 
@@ -644,23 +723,37 @@ function updateStats() {
 
 function updateAdminProxyScanButton() {
   const taskRunning = Boolean(state.scanTask?.running || state.scanning);
-  const scanBusy = state.localScanning || state.serverFullScanStarting || state.proxyOnlyScanStarting;
+  const sponsoredRunning = Boolean(state.sponsoredUpdate?.running);
+  const scanBusy = state.localScanning || state.serverFullScanStarting || state.proxyOnlyScanStarting || sponsoredRunning;
   const allBusy = scanBusy || state.priceaiSyncStarting || state.priceaiSyncing;
   elements.adminTokenVerifyButton.disabled = allBusy;
-  elements.adminFullScanButton.disabled = scanBusy || !state.adminVerified;
+  elements.adminFullScanButton.disabled = true;
   elements.adminFullScanButton.classList.toggle('scanning', taskRunning);
-  elements.adminFullScanButton.textContent = taskRunning ? '服务器扫描中' : '服务器全量扫描';
+  elements.adminFullScanButton.textContent = '服务器全量更新 · 暂停';
+  const sponsored = state.sponsoredUpdate || {};
+  const sponsoredTotal = Number(sponsored.total || 0);
+  const sponsoredDone = Number(sponsored.completed || 0);
+  const sponsoredPosition = Number(sponsored.next_position || sponsoredDone + 1);
+  elements.sponsoredUpdateButton.disabled = (state.localScanning || taskRunning) || !state.adminVerified;
+  elements.sponsoredUpdateButton.classList.toggle('scanning', sponsoredRunning);
+  elements.sponsoredUpdateButton.textContent = sponsoredTotal
+    ? (sponsoredRunning
+      ? (sponsored.stop_requested
+        ? `停止中 ${Math.min(sponsoredPosition, sponsoredTotal)}/${sponsoredTotal}`
+        : `停止赞助更新 ${Math.min(sponsoredPosition, sponsoredTotal)}/${sponsoredTotal}`)
+      : `赞助更新 ${sponsoredDone}/${sponsoredTotal}`)
+    : '赞助更新';
   elements.adminProxyScanButton.disabled = scanBusy || !state.adminVerified;
   elements.adminProxyScanButton.classList.toggle('scanning', taskRunning && state.scanTask?.reason === 'manual_proxy_only');
   elements.adminProxyScanButton.textContent = taskRunning && state.scanTask?.reason === 'manual_proxy_only'
     ? '代理扫描中'
     : '代理全量扫描';
   elements.priceaiSyncButton.disabled = state.priceaiSyncStarting || state.priceaiSyncing || !state.adminVerified;
+  elements.browserFactoryButton.disabled = state.localScanning;
   elements.priceaiSyncButton.classList.toggle('scanning', state.priceaiSyncing);
   elements.priceaiSyncButton.textContent = state.priceaiSyncing ? 'PriceAI 同步中' : '同步 PriceAI';
   if (!state.localScanning) {
-    elements.localScanLabel.textContent = state.adminVerified ? '服务器全量扫描' : '本地全部扫描';
-    elements.filteredScanLabel.textContent = state.adminVerified ? '服务器刷新筛选' : '刷新当前筛选';
+    elements.localScanLabel.textContent = '服务器全量更新';
   }
 }
 
@@ -724,6 +817,23 @@ async function startServerFullScan() {
   }
 }
 
+async function startSponsoredUpdate() {
+  if (state.localScanning) return;
+  const headers = getAdminHeaders();
+  if (!headers) return;
+  try {
+    const running = Boolean(state.sponsoredUpdate?.running);
+    const result = await api(running ? 'api/sponsored-update/stop' : 'api/sponsored-update/start', { method: 'POST', headers });
+    state.adminVerified = true;
+    state.sponsoredUpdate = { ...state.sponsoredUpdate, ...result };
+    updateAdminProxyScanButton();
+    toast(result.message || '赞助更新已启动');
+  } catch (error) {
+    forgetAdminKey(error);
+    toast(error.message, true);
+  }
+}
+
 async function startAdminProxyScan() {
   if (state.localScanning || state.proxyOnlyScanStarting) return;
   const headers = getAdminHeaders();
@@ -771,7 +881,6 @@ function setScanning(scanning, detail = '') {
   state.scanning = scanning;
   const busy = scanning || state.localScanning;
   elements.localScanButton.disabled = state.localScanning;
-  elements.filteredLocalScanButton.disabled = state.localScanning;
   elements.scanPulse.classList.toggle('active', busy);
   updateAdminProxyScanButton();
   if (!state.localScanning) {
@@ -785,14 +894,14 @@ function setLocalScanning(scanning, detail = '', label = '', target = state.loca
   state.localScanTarget = scanning ? target : '';
   const busy = scanning || state.scanning;
   elements.localScanButton.disabled = scanning;
-  elements.filteredLocalScanButton.disabled = scanning;
+  if (elements.filteredLocalScanButton) elements.filteredLocalScanButton.disabled = scanning;
   elements.localScanButton.classList.toggle('scanning', scanning && target === 'all');
-  elements.filteredLocalScanButton.classList.toggle('scanning', scanning && target === 'filter');
+  elements.filteredLocalScanButton?.classList.toggle('scanning', scanning && target === 'filter');
   for (const button of elements.tabs.querySelectorAll('[data-refresh-category]')) button.disabled = scanning;
   elements.scanPulse.classList.toggle('active', busy);
   updateAdminProxyScanButton();
   elements.localScanLabel.textContent = scanning && target === 'all' ? (label || '本地扫描中') : '本地全部扫描';
-  elements.filteredScanLabel.textContent = scanning && target === 'filter' ? (label || '筛选页刷新中') : '刷新当前筛选';
+  if (elements.filteredScanLabel) elements.filteredScanLabel.textContent = scanning && target === 'filter' ? (label || '筛选页刷新中') : '刷新当前筛选';
   if (scanning) {
     elements.scanText.textContent = '本地扫描进行中';
     elements.scanDetail.textContent = detail || '正在使用当前设备的网络采集';
@@ -906,6 +1015,18 @@ function connectEvents() {
     }
     setScanning(Boolean(payload.scanning), scanMessage(payload));
   });
+  stream.addEventListener('sponsored_update', (event) => {
+    const payload = JSON.parse(event.data);
+    state.sponsoredUpdate = { ...state.sponsoredUpdate, ...payload };
+    updateAdminProxyScanButton();
+    if (payload.phase === 'paused') {
+      const label = `赞助更新暂停：${payload.current_token || '当前店铺'} ${payload.last_error || ''}`;
+      elements.scanDetail.textContent = label;
+      toast(label, true);
+    } else if (payload.phase === 'source_started') {
+      elements.scanDetail.textContent = `赞助更新 ${payload.next_position || payload.position || 0}/${payload.total || 0}：${payload.current_token || ''}`;
+    }
+  });
   stream.addEventListener('snapshot', (event) => {
     const payload = JSON.parse(event.data);
     const nextRevision = Number(payload.catalog_revision || state.catalogRevision);
@@ -914,6 +1035,8 @@ function connectEvents() {
     state.stats = payload.stats || state.stats;
     state.catalogRevision = nextRevision;
     state.scanTask = payload.scan_task || state.scanTask;
+    state.sponsoredUpdate = payload.sponsored_update || state.sponsoredUpdate;
+    updateAdminProxyScanButton();
     renderSources();
     updateStats();
     renderTabs();
@@ -981,20 +1104,36 @@ function renderSources() {
   }).join('');
 }
 
-function historySeries(history, mode) {
-  const points = [...history].sort((a, b) => Number(a.recorded_at) - Number(b.recorded_at));
-  if (mode === 'price') {
-    return points
-      .filter((point) => Number.isFinite(Number(point.price)) && Number(point.price) >= 0)
-      .map((point) => ({ ...point, value: Number(point.price) }));
-  }
-  return points
-    .filter((point) => Number.isFinite(Number(point.stock_count)) && Number(point.stock_count) >= 0)
-    .map((point) => ({ ...point, value: Number(point.stock_count) }));
+function historyBucket(timestamp, granularity) {
+  const date = new Date(Number(timestamp) * 1000);
+  if (granularity === 'hour') return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}-${date.getHours()}`;
+  if (granularity === 'day') return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+  const monday = new Date(date); const offset = (monday.getDay() + 6) % 7;
+  monday.setDate(monday.getDate() - offset); monday.setHours(0, 0, 0, 0);
+  return `${monday.getFullYear()}-${monday.getMonth()}-${monday.getDate()}`;
 }
 
-function historySvg(history, mode) {
-  const points = historySeries(history, mode);
+function historyTimeLabel(timestamp, granularity) {
+  const date = new Date(Number(timestamp) * 1000);
+  if (granularity === 'hour') return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, '0')}:00`;
+  if (granularity === 'day') return `${date.getMonth() + 1}/${date.getDate()}`;
+  const monday = new Date(date); const offset = (monday.getDay() + 6) % 7;
+  monday.setDate(monday.getDate() - offset);
+  return `${monday.getMonth() + 1}/${monday.getDate()} 周`;
+}
+
+function historySeries(history, mode, granularity) {
+  const points = [...history].sort((a, b) => Number(a.recorded_at) - Number(b.recorded_at));
+  const usable = mode === 'price'
+    ? points.filter((point) => Number.isFinite(Number(point.price)) && Number(point.price) >= 0).map((point) => ({ ...point, value: Number(point.price) }))
+    : points.filter((point) => Number.isFinite(Number(point.stock_count)) && Number(point.stock_count) >= 0).map((point) => ({ ...point, value: Number(point.stock_count) }));
+  const buckets = new Map();
+  for (const point of usable) buckets.set(historyBucket(point.recorded_at, granularity), point);
+  return [...buckets.values()];
+}
+
+function historySvg(history, mode, granularity) {
+  const points = historySeries(history, mode, granularity);
   const labels = { price: '价格', stock: '库存余量' };
   if (!points.length) return `<div class="history-empty">暂无可用${labels[mode]}节点，等待下一次成功刷新。</div>`;
 
@@ -1022,12 +1161,11 @@ function historySvg(history, mode) {
     const detail = mode === 'price' ? `库存 ${escapeHtml(point.stock_count)}` : `价格 ¥${money(point.price)}`;
     return `<circle cx="${x(index)}" cy="${y(Number(point.value))}" r="3"><title>${escapeHtml(dateTime(point.recorded_at))} · ${escapeHtml(labels[mode])} ${value} · ${detail}</title></circle>`;
   }).join('');
-  const firstTime = dateTime(points[0].recorded_at);
-  const lastTime = dateTime(points[points.length - 1].recorded_at);
+  const tickIndexes = [...new Set([0, Math.round((points.length - 1) / 2), points.length - 1])];
+  const times = tickIndexes.map((index) => `<text class="chart-time" x="${x(index)}" y="${height - 12}" text-anchor="${index === 0 ? 'start' : index === points.length - 1 ? 'end' : 'middle'}">${escapeHtml(historyTimeLabel(points[index].recorded_at, granularity))}</text>`).join('');
   return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(labels[mode])}随刷新时间变化的折线图">
     <g class="chart-grid">${grids}</g><path class="chart-area ${mode === 'price' ? 'chart-price-area' : ''}" d="${area}"/><path class="chart-line ${mode === 'price' ? 'chart-price-line' : ''}" d="${path}"/><g class="chart-points ${mode === 'price' ? 'chart-price-points' : ''}">${circles}</g>
-    <text class="chart-time" x="${margin.left}" y="${height - 12}">${escapeHtml(firstTime)}</text>
-    <text class="chart-time" x="${width - margin.right}" y="${height - 12}" text-anchor="end">${escapeHtml(lastTime)}</text>
+    ${times}
   </svg>`;
 }
 
@@ -1037,7 +1175,12 @@ function renderHistoryChart() {
     button.classList.toggle('active', active);
     button.setAttribute('aria-selected', String(active));
   }
-  elements.historyChart.innerHTML = historySvg(state.history, state.historyMode);
+  for (const button of elements.historyGranularity.querySelectorAll('[data-history-granularity]')) {
+    const active = button.dataset.historyGranularity === state.historyGranularity;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  }
+  elements.historyChart.innerHTML = historySvg(state.history, state.historyMode, state.historyGranularity);
 }
 
 async function openPriceHistory(goodsKey) {
@@ -1054,6 +1197,7 @@ async function openPriceHistory(goodsKey) {
     const history = payload.history || [];
     state.history = history;
     state.historyMode = 'price';
+    state.historyGranularity = 'hour';
     const prices = history.map((point) => Number(point.price)).filter(Number.isFinite);
     const latest = history[0] || { price: product.price, recorded_at: product.last_seen };
     const lowest = prices.length ? Math.min(...prices) : Number(product.price);
@@ -1156,6 +1300,17 @@ async function refreshProduct(goodsKey) {
 async function refreshProductWithLocalIp(goodsKey) {
   if (!goodsKey || state.refreshingProducts.has(goodsKey) || state.localScanning) return;
   const product = state.products.get(goodsKey);
+  if (product?.off_shelf) {
+    toast('已下架商品不会再刷新', true);
+    return;
+  }
+  const visitorLazyProduct = product && (Boolean(product.platform_banned)
+    || (Number(product.stock_count) === 0 && Number(product.out_of_stock_since || 0) > 0
+      && Date.now() / 1000 - Number(product.out_of_stock_since) >= 24 * 60 * 60));
+  if (visitorLazyProduct && !state.adminVerified) {
+    toast('长期缺货商品每日极懒更新；平台封禁商品由服务器后台复查', true);
+    return;
+  }
   const configuredSource = state.sources.find((item) => item.token === product?.source_token);
   const source = configuredSource || fallbackLocalSource(product);
   if (product?.source_token === 'priceai.cc:top5' || source?.source_kind === 'snapshot') {
@@ -1195,11 +1350,41 @@ async function refreshProductWithLocalIp(goodsKey) {
     await refreshVisibleProducts([product.goods_key], state.productRequestId);
     toast(result.changed ? 'Product refreshed through this device.' : 'Product information is already current.');
   } catch (error) {
-    toast(`Local refresh failed: ${error.message}`, true);
+    if (isLocalOffShelfError(error)) {
+      try {
+        await markLocalProductOffShelf(product, source, error.message);
+        await refreshVisibleProducts([product.goods_key], state.productRequestId);
+        toast('商品未上架，已移入“已下架”');
+      } catch (reportError) {
+        toast(`商品未上架，但更新服务器状态失败: ${reportError.message}`, true);
+      }
+    } else {
+      toast(`Local refresh failed: ${error.message}`, true);
+    }
   } finally {
     setProductRefreshing(goodsKey, false);
     setLocalScanning(false, state.autoScanEnabled ? 'Automatic scanning is enabled.' : 'Automatic scanning is paused.', '', 'filter');
   }
+}
+
+function isLocalOffShelfError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return ['商品未上架', '商品已下架', '商品不存在', '不存在或已下架',
+    'goods not found', 'item not found', 'not listed', 'off shelf', 'off-shelf']
+    .some((marker) => message.includes(marker));
+}
+
+async function markLocalProductOffShelf(product, source, reason = '') {
+  return api('api/local-scan/products', {
+    method: 'POST',
+    body: JSON.stringify({
+      token: source.token,
+      source_name: product.source_name || source.name || source.token,
+      items: [],
+      requested_keys: [product.goods_key],
+      off_shelf_reason: String(reason).slice(0, 300),
+    }),
+  });
 }
 
 const LOCAL_LDXP_BASE_URL = 'https://pay.ldxp.cn';
@@ -1476,21 +1661,17 @@ async function localFilteredScan(scopeLabel = '当前筛选') {
     await startServerFullScan();
     return;
   }
-  setLocalScanning(true, `正在读取${scopeLabel}结果`, '筛选读取中', 'filter');
+  setLocalScanning(true, `正在向服务器领取${scopeLabel}刷新任务`, '领取刷新任务', 'filter');
   try {
-    const products = await loadAllFilteredProducts((loaded, total) => {
-      setLocalScanning(
-        true,
-        `正在读取${scopeLabel}结果（${loaded}/${total || '…'}）`,
-        '筛选读取中',
-        'filter',
-      );
+    const allocation = await api('api/user-refresh/claim', {
+      method: 'POST', body: JSON.stringify(currentUserRefreshScope()),
     });
+    const products = allocation.products || [];
     if (!products.length) {
       toast(`${scopeLabel}没有可刷新的商品`, true);
       return;
     }
-    setLocalScanning(true, `准备刷新${scopeLabel}的 ${products.length} 件商品`, '筛选刷新 0%', 'filter');
+    setLocalScanning(true, `已领取服务器队列 ${allocation.offset + 1}-${allocation.next_offset} / ${allocation.total}，开始逐个刷新`, `筛选刷新 0/${products.length}`, 'filter');
     const result = await refreshLocalProducts(products, (source, current, total) => {
       setLocalScanning(
         true,
@@ -1504,6 +1685,63 @@ async function localFilteredScan(scopeLabel = '当前筛选') {
     toast(error.message, true);
   } finally {
     setLocalScanning(false, state.autoScanEnabled ? '服务器自动扫描已在后台开启' : '服务器自动扫描已在后台暂停', '', 'filter');
+    await loadState();
+  }
+}
+
+async function runBrowserFactory() {
+  if (state.localScanning) return;
+  elements.browserFactoryStatus.textContent = '正在领取任务...';
+  elements.browserFactoryStatus.classList.remove('success', 'error');
+  setLocalScanning(true, '正在领取服务器刷新任务', '工厂任务准备中', 'filter');
+  try {
+    const multiplier = Math.max(1, Math.min(5, Math.trunc(Number(elements.browserFactoryMultiplier.value) || 1)));
+    elements.browserFactoryMultiplier.value = String(multiplier);
+    const allocation = await api('api/browser-factory/claim', {
+      method: 'POST', body: JSON.stringify({ multiplier }),
+    });
+    const sources = allocation.sources || [];
+    if (!sources.length) {
+      toast('当前没有可领取的服务器刷新任务');
+      elements.browserFactoryStatus.textContent = '当前没有可领取任务';
+      return;
+    }
+    let completed = 0; let failed = 0; let matched = 0;
+    elements.browserFactoryStatus.textContent = `已领取 ${sources.length} 个 · 0/${sources.length}`;
+    for (let index = 0; index < sources.length; index += 1) {
+      const source = sources[index];
+      elements.browserFactoryStatus.textContent = `${index + 1}/${sources.length} · 成功 ${completed} · 失败 ${failed} · ${source.name || source.token}`;
+      setLocalScanning(true, `正在刷新 ${source.name || source.token}`, `工厂任务 ${index + 1}/${sources.length}`, 'filter');
+      try {
+        const collected = await collectLocalSource(source);
+        const result = await api('api/local-scan/source', {
+          method: 'POST',
+          body: JSON.stringify({
+            token: source.token,
+            source_name: collected.sourceName,
+            items: collected.items,
+            complete: true,
+            lease_id: allocation.lease_id,
+          }),
+        });
+        completed += 1;
+        matched += Number(result.matched || 0);
+        elements.browserFactoryStatus.textContent = `${index + 1}/${sources.length} · 成功 ${completed} · 失败 ${failed} · 匹配 ${matched}`;
+      } catch (error) {
+        failed += 1;
+        elements.browserFactoryStatus.textContent = `${index + 1}/${sources.length} · 成功 ${completed} · 失败 ${failed} · ${source.name || source.token}`;
+        console.warn(`Browser factory task failed for ${source.token}:`, error);
+      }
+    }
+    elements.browserFactoryStatus.textContent = `完成 ${sources.length}/${sources.length} · 成功 ${completed} · 失败 ${failed} · 匹配 ${matched}`;
+    elements.browserFactoryStatus.classList.add(failed > 0 ? 'error' : 'success');
+    toast(`工厂任务完成：成功 ${completed}，失败 ${failed}，匹配 ${matched} 件`, failed > 0);
+  } catch (error) {
+    elements.browserFactoryStatus.textContent = `领取失败：${error.message}`;
+    elements.browserFactoryStatus.classList.add('error');
+    toast(error.message, true);
+  } finally {
+    setLocalScanning(false, state.autoScanEnabled ? '服务器自动扫描已开启' : '服务器自动扫描已暂停', '', 'filter');
     await loadState();
   }
 }
@@ -1531,13 +1769,17 @@ async function loadAllFilteredProducts(onProgress) {
 
 async function localManualScan() {
   if (state.localScanning) return;
-  if (state.adminVerified) {
-    await startServerFullScan();
+  if (!state.adminVerified) {
+    toast('全量更新已改由服务器队列执行，请使用管理员令牌启动服务器全量扫描', true);
     return;
   }
-  const sources = state.sources.filter(
+  await startServerFullScan();
+  return;
+  /* Legacy local full-store scan kept below for reference; normal users no longer run it. */
+  const allSources = state.sources.filter(
     (source) => source.enabled && source.source_kind === 'shop_api'
   );
+  const sources = allSources.slice(0, REGULAR_USER_REFRESH_LIMIT);
   if (!sources.length) {
     toast('没有已启用的采集源', true);
     return;
@@ -1546,6 +1788,7 @@ async function localManualScan() {
   let succeeded = 0;
   let failed = 0;
   let matched = 0;
+  if (allSources.length > sources.length) toast(`普通用户每次最多刷新 ${REGULAR_USER_REFRESH_LIMIT} 个店铺，本次仅扫描前 ${sources.length} 个`);
   setLocalScanning(true, '准备使用当前设备的网络', `本地扫描 0/${sources.length}`, 'all');
   try {
     for (let index = 0; index < sources.length; index += 1) {
@@ -1599,7 +1842,118 @@ function applyPriceRange() {
   renderProducts();
 }
 
+function commentSort(a, b) {
+  return Number(b.pinned) - Number(a.pinned)
+    || Number(b.pinned_at) - Number(a.pinned_at)
+    || Number(b.created_at) - Number(a.created_at);
+}
+
+function compressCommentImage(file) {
+  return new Promise((resolve, reject) => {
+    const image = new Image(); const source = URL.createObjectURL(file);
+    image.onload = () => {
+      URL.revokeObjectURL(source); const scale = Math.min(1, 1600 / Math.max(image.width, image.height));
+      const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(image.width * scale)); canvas.height = Math.max(1, Math.round(image.height * scale));
+      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => { if (!blob) { reject(new Error('图片转换失败')); return; } const reader = new FileReader(); reader.onload = () => resolve({ data: reader.result, preview: URL.createObjectURL(blob) }); reader.onerror = () => reject(new Error('图片读取失败')); reader.readAsDataURL(blob); }, 'image/jpeg', .78);
+    }; image.onerror = () => { URL.revokeObjectURL(source); reject(new Error('无法读取图片')); }; image.src = source;
+  });
+}
+
+function renderDrawerImages(target, images) {
+  target.innerHTML = images.map((item, index) => `<span><img src="${escapeHtml(item.preview)}" alt="待上传图片"><button type="button" data-remove-comment-image="${index}">×</button></span>`).join('');
+}
+
+function addDrawerImages(files, bucket, target) {
+  (async () => {
+    for (const file of files) {
+      if (bucket.length >= 5) { toast('一条评论最多 5 张图片', true); break; }
+      if (!/^image\/(png|jpeg)$/.test(file.type)) { toast('只支持 PNG 或 JPEG 图片', true); continue; }
+      try { const item = await compressCommentImage(file); if (String(item.data).length > 1_200_000) { URL.revokeObjectURL(item.preview); toast('图片压缩后仍过大', true); } else bucket.push(item); }
+      catch (error) { toast(error.message, true); }
+    }
+    renderDrawerImages(target, bucket);
+  })();
+}
+
+function scoreButtons() {
+  for (const field of document.querySelectorAll('.score-fields > div')) {
+    const stars = field.querySelector('.stars');
+    if (!stars.children.length) stars.innerHTML = [1, 2, 3, 4, 5].map((value) => `<button type="button" data-score="${value}">★</button>`).join('');
+  }
+}
+
+function renderDrawerComments() {
+  const comments = [...state.commentDrawer.comments.values()].sort(commentSort);
+  elements.drawerCommentList.innerHTML = comments.length ? comments.map((comment) => {
+    const avatar = comment.avatar ? `<img class="comment-avatar" src="${escapeHtml(comment.avatar)}" alt="">` : `<span class="comment-avatar default-avatar">${escapeHtml((comment.author || '匿').slice(0, 1))}</span>`;
+    const ratings = [['商品', comment.product_score], ['商铺', comment.shop_score], ['体验', comment.experience_score]].filter(([, score]) => score !== null && score !== undefined).map(([name, score]) => `<span class="tag">${name} ${Number(score).toFixed(1)} ★</span>`).join('');
+    const images = (comment.images || []).map((url) => `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><img src="${escapeHtml(url)}" alt="评论图片" loading="lazy"></a>`).join('');
+    const pin = comment.pinned ? '<span class="comment-pin">置顶</span>' : '';
+    const adminBadge = comment.is_admin ? '<span class="comment-admin-badge">管理员认证</span>' : comment.admin_verified ? '<span class="comment-verified-badge">管理员已认证</span>' : '';
+    const pinButton = state.adminVerified ? `<button class="comment-pin-toggle" data-comment-pin="${escapeHtml(comment.id)}" data-pinned="${comment.pinned}">${comment.pinned ? '取消置顶' : '置顶'}</button>` : '';
+    const verifyButton = state.adminVerified ? `<button class="comment-pin-toggle" data-comment-verify="${escapeHtml(comment.id)}" data-verified="${comment.admin_verified}">${comment.admin_verified ? '取消认证' : '认证评论'}</button>` : '';
+    const replies = (comment.replies || []).map((reply) => `<div class="comment-reply"><strong>${escapeHtml(reply.author || '匿名用户')}${reply.is_admin ? ' · 管理员认证' : ''}</strong><span>${escapeHtml(reply.body)}</span></div>`).join('');
+    return `<article class="comment-item ${comment.pinned ? 'pinned' : ''}"><div class="comment-author">${avatar}<strong>${escapeHtml(comment.author || '匿名用户')}</strong>${adminBadge}${pin}<time>${relativeTime(comment.created_at)}</time>${pinButton}${verifyButton}</div>${comment.body ? `<p>${escapeHtml(comment.body)}</p>` : ''}${ratings ? `<div class="tags">${ratings}</div>` : ''}${images ? `<div class="comment-images">${images}</div>` : ''}<div class="comment-replies">${replies}</div><form class="reply-form" data-reply-comment="${escapeHtml(comment.id)}"><textarea maxlength="200" placeholder="回复这条评论…"></textarea><div><button type="button" data-emoji="😀">😀</button><button type="button" data-emoji="👍">👍</button><button type="button" data-emoji="❤️">❤️</button><button type="submit">回复</button></div></form></article>`;
+  }).join('') : '<div class="comment-empty">暂无评论，等待第一条分享。</div>';
+  const metric = state.commentMetrics.get(state.commentDrawer.goodsKey) || {};
+  elements.commentMetric.textContent = metric.rating_count ? `评论 ${metric.comment_count || comments.length} 条 · 加权评分 ${Number(metric.weighted_score).toFixed(2)} · ${metric.rating_count} 项评分` : `评论 ${metric.comment_count || comments.length} 条 · 暂无参与评分`;
+}
+
+async function fetchDrawerComments(after = 0) {
+  const key = state.commentDrawer.goodsKey; if (!key) return;
+  const payload = await api(`api/products/${encodeURIComponent(key)}/comments?after=${after}`);
+  for (const comment of payload.comments || []) state.commentDrawer.comments.set(comment.id, comment);
+  state.commentMetrics.set(key, payload.metrics || {}); renderDrawerComments();
+}
+
+async function openCommentDrawer(goodsKey, push = true) {
+  const product = state.products.get(goodsKey); if (!product) return;
+  state.commentDrawer.goodsKey = goodsKey;
+  if (!state.commentDrawer.comments.size || state.commentDrawer.lastKey !== goodsKey) { state.commentDrawer.comments = new Map(); state.commentDrawer.lastKey = goodsKey; }
+  elements.commentDialogTitle.textContent = product.name;
+  elements.commentDialogProduct.innerHTML = `${product.image ? `<img src="${escapeHtml(product.image)}" alt="" referrerpolicy="no-referrer">` : '<span class="fallback">LDXP</span>'}<div><small>${escapeHtml(product.source_name || product.source_token)}</small><strong>${escapeHtml(product.name)}</strong></div>`;
+  scoreButtons(); if (!elements.commentDialog.open) elements.commentDialog.showModal();
+  if (push) history.pushState({ ldxpCommentGoodsKey: goodsKey }, '', `#comments=${encodeURIComponent(goodsKey)}`);
+  try { await fetchDrawerComments(); } catch (error) { toast(error.message, true); }
+}
+
+function closeCommentDrawer(fromHistory = false) {
+  if (!elements.commentDialog.open) return;
+  elements.commentDialog.close();
+  if (!fromHistory && history.state?.ldxpCommentGoodsKey) history.back();
+}
+
+function submitDrawerComment(body, images, scores = {}) {
+  const key = state.commentDrawer.goodsKey; if (!key) return Promise.reject(new Error('未选择商品'));
+  const headers = state.adminVerified ? getAdminHeaders() : {};
+  return api(`api/products/${encodeURIComponent(key)}/comments`, { method: 'POST', headers: headers || {}, body: JSON.stringify({ author: elements.drawerCommentAuthor.value.trim(), avatar: state.commentDrawer.avatar?.data || '', body, images: images.map((item) => item.data), scores }) }).then((payload) => {
+    state.commentDrawer.comments.set(payload.comment.id, payload.comment);
+    const previews = state.commentPreviews.get(key) || []; state.commentPreviews.set(key, [payload.comment, ...previews.filter((item) => item.id !== payload.comment.id)].slice(0, 10));
+    state.commentMetrics.set(key, payload.metrics || state.commentMetrics.get(key) || {}); updateCommentPreview(key); renderDrawerComments(); return payload;
+  });
+}
+
 document.addEventListener('click', (event) => {
+  const voteButton = event.target.closest('[data-comment-vote]');
+  if (voteButton) {
+    event.preventDefault(); event.stopPropagation();
+    const card = voteButton.closest('.product-card'); const goodsKey = card?.dataset.key;
+    if (goodsKey) void api(`api/products/${encodeURIComponent(goodsKey)}/comments/${encodeURIComponent(voteButton.dataset.commentId)}/vote`, { method: 'POST', body: JSON.stringify({ voter_key: commentVoterKey, value: Number(voteButton.dataset.commentVote) }) }).then((payload) => { const comments = state.commentPreviews.get(goodsKey) || []; const target = comments.find((comment) => comment.id === payload.vote.id); if (target) { target.upvotes = payload.vote.upvotes; target.downvotes = payload.vote.downvotes; updateCommentPreview(goodsKey); } }).catch((error) => toast(error.message, true));
+    return;
+  }
+  const commentArea = event.target.closest('.comment-area-button');
+  if (commentArea) { event.preventDefault(); event.stopPropagation(); const goodsKey = commentArea.closest('.product-card')?.dataset.key; if (goodsKey) location.href = `comments.html?product=${encodeURIComponent(goodsKey)}`; return; }
+  const commentRefresh = event.target.closest('.comment-refresh-button');
+  if (commentRefresh) { event.preventDefault(); event.stopPropagation(); const goodsKey = commentRefresh.closest('.product-card')?.dataset.key; if (goodsKey) void loadCommentPreviews([goodsKey]); return; }
+  const commentPreview = event.target.closest('.comment-carousel');
+  if (commentPreview) {
+    event.preventDefault();
+    event.stopPropagation();
+    const goodsKey = commentPreview.closest('.product-card')?.dataset.key;
+    if (goodsKey) void openCommentDrawer(goodsKey);
+    return;
+  }
   const historyButton = event.target.closest('.product-history');
   if (historyButton) {
     event.preventDefault();
@@ -1659,7 +2013,6 @@ elements.loadBatchSize.addEventListener('change', (event) => {
 });
 elements.loadMoreButton.addEventListener('click', () => { void loadProductBatch(); });
 elements.localScanButton.addEventListener('click', localManualScan);
-elements.filteredLocalScanButton.addEventListener('click', () => { void localFilteredScan(); });
 elements.adminTokenVerifyButton.addEventListener('click', () => { void verifyAdminToken(); });
 elements.adminTokenInput.addEventListener('input', () => {
   state.adminVerified = false;
@@ -1667,6 +2020,8 @@ elements.adminTokenInput.addEventListener('input', () => {
   renderSources();
 });
 elements.adminFullScanButton.addEventListener('click', () => { void startServerFullScan(); });
+elements.sponsoredUpdateButton.addEventListener('click', () => { void startSponsoredUpdate(); });
+elements.browserFactoryButton.addEventListener('click', () => { void runBrowserFactory(); });
 elements.adminProxyScanButton.addEventListener('click', () => { void startAdminProxyScan(); });
 elements.priceaiSyncButton.addEventListener('click', () => { void startPriceaiSync(); });
 elements.historyModes.addEventListener('click', (event) => {
@@ -1675,6 +2030,32 @@ elements.historyModes.addEventListener('click', (event) => {
   state.historyMode = button.dataset.historyMode;
   renderHistoryChart();
 });
+elements.historyGranularity.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-history-granularity]');
+  if (!button) return;
+  state.historyGranularity = button.dataset.historyGranularity;
+  renderHistoryChart();
+});
+elements.ratingSort.addEventListener('change', (event) => { state.ratingSort = event.target.checked; renderProducts(); });
+elements.drawerAdminToken.value = sessionStorage.getItem('ldxp-admin-key') || '';
+elements.drawerAdminToken.addEventListener('input', () => { elements.adminTokenInput.value = elements.drawerAdminToken.value; state.adminVerified = false; elements.drawerAdminState.textContent = '普通评论'; });
+elements.drawerAdminVerify.addEventListener('click', async () => { const key = elements.drawerAdminToken.value.trim(); if (!key) { toast('请输入管理员 Token', true); return; } elements.adminTokenInput.value = key; try { await api('api/admin/verify', { method: 'POST', headers: { 'X-LDXP-Admin-Key': key } }); sessionStorage.setItem('ldxp-admin-key', key); state.adminVerified = true; elements.drawerAdminState.textContent = '管理员认证：发布将标记为管理员评论'; renderDrawerComments(); toast('管理员认证成功'); } catch (error) { state.adminVerified = false; elements.drawerAdminState.textContent = '普通评论'; toast(error.message, true); } });
+elements.commentCloseButton.addEventListener('click', () => closeCommentDrawer());
+elements.commentRefreshButton.addEventListener('click', () => { const newest = Math.max(0, ...[...state.commentDrawer.comments.values()].map((comment) => Number(comment.created_at) || 0)); void fetchDrawerComments(newest).catch((error) => toast(error.message, true)); });
+elements.drawerCommentImages.addEventListener('change', (event) => { addDrawerImages([...event.target.files], state.commentDrawer.images, elements.drawerImagePreview); event.target.value = ''; });
+elements.drawerCommentAvatar.addEventListener('change', async (event) => { const file = event.target.files?.[0]; event.target.value = ''; if (!file) return; if (!/^image\/(png|jpeg)$/.test(file.type)) { toast('头像只支持 PNG 或 JPEG 图片', true); return; } try { const avatar = await new Promise((resolve, reject) => { const image = new Image(); const source = URL.createObjectURL(file); image.onload = () => { URL.revokeObjectURL(source); const scale = Math.min(1, 96 / Math.max(image.width, image.height)); const canvas = document.createElement('canvas'); canvas.width = Math.max(1, Math.round(image.width * scale)); canvas.height = Math.max(1, Math.round(image.height * scale)); canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height); canvas.toBlob((blob) => { if (!blob) { reject(new Error('头像转换失败')); return; } const reader = new FileReader(); reader.onload = () => resolve({ data: reader.result, preview: URL.createObjectURL(blob) }); reader.readAsDataURL(blob); }, 'image/jpeg', .76); }; image.onerror = () => { URL.revokeObjectURL(source); reject(new Error('无法读取头像')); }; image.src = source; }); if (String(avatar.data).length > 140000) { URL.revokeObjectURL(avatar.preview); throw new Error('头像压缩后仍过大'); } if (state.commentDrawer.avatar?.preview) URL.revokeObjectURL(state.commentDrawer.avatar.preview); state.commentDrawer.avatar = avatar; elements.drawerAvatarPreview.innerHTML = `<img src="${escapeHtml(avatar.preview)}" alt="待上传头像">`; } catch (error) { toast(error.message, true); } });
+elements.quickCommentImages.addEventListener('change', (event) => { addDrawerImages([...event.target.files], state.commentDrawer.quickImages, elements.quickImagePreview); event.target.value = ''; });
+elements.drawerImagePreview.addEventListener('click', (event) => { const button = event.target.closest('[data-remove-comment-image]'); if (!button) return; const [item] = state.commentDrawer.images.splice(Number(button.dataset.removeCommentImage), 1); if (item) URL.revokeObjectURL(item.preview); renderDrawerImages(elements.drawerImagePreview, state.commentDrawer.images); });
+elements.quickImagePreview.addEventListener('click', (event) => { const button = event.target.closest('[data-remove-comment-image]'); if (!button) return; const [item] = state.commentDrawer.quickImages.splice(Number(button.dataset.removeCommentImage), 1); if (item) URL.revokeObjectURL(item.preview); renderDrawerImages(elements.quickImagePreview, state.commentDrawer.quickImages); });
+elements.drawerCommentBody.addEventListener('paste', (event) => { const files = [...(event.clipboardData?.files || [])]; if (files.length) { event.preventDefault(); addDrawerImages(files, state.commentDrawer.images, elements.drawerImagePreview); } });
+elements.quickCommentBody.addEventListener('paste', (event) => { const files = [...(event.clipboardData?.files || [])]; if (files.length) { event.preventDefault(); addDrawerImages(files, state.commentDrawer.quickImages, elements.quickImagePreview); } });
+document.querySelector('.score-fields').addEventListener('click', (event) => { const button = event.target.closest('[data-score]'); if (!button) return; const field = button.closest('[data-score-field]'); field.dataset.score = button.dataset.score; field.querySelectorAll('[data-score]').forEach((star) => star.classList.toggle('active', Number(star.dataset.score) <= Number(button.dataset.score))); });
+elements.drawerCommentForm.addEventListener('click', (event) => { const emoji = event.target.closest('[data-emoji]'); if (!emoji) return; elements.drawerCommentBody.value += emoji.dataset.emoji; elements.drawerCommentBody.focus(); });
+elements.drawerCommentForm.addEventListener('submit', async (event) => { event.preventDefault(); const scores = {}; document.querySelectorAll('.score-fields > div').forEach((field) => { if (field.querySelector('input').checked) scores[field.dataset.scoreField] = Number(field.dataset.score || 0); }); const body = elements.drawerCommentBody.value.trim(); if (!body && !state.commentDrawer.images.length && !Object.keys(scores).length) { toast('请填写评论、添加图片或参与评分', true); return; } try { await submitDrawerComment(body, state.commentDrawer.images, scores); elements.drawerCommentBody.value = ''; state.commentDrawer.images.forEach((item) => URL.revokeObjectURL(item.preview)); state.commentDrawer.images = []; if (state.commentDrawer.avatar?.preview) URL.revokeObjectURL(state.commentDrawer.avatar.preview); state.commentDrawer.avatar = null; elements.drawerAvatarPreview.innerHTML = ''; renderDrawerImages(elements.drawerImagePreview, []); toast('评论已发布'); } catch (error) { toast(error.message, true); } });
+elements.quickCommentForm.addEventListener('submit', async (event) => { event.preventDefault(); const body = elements.quickCommentBody.value.trim(); if (!body && !state.commentDrawer.quickImages.length) { toast('请填写评论或添加图片', true); return; } try { await submitDrawerComment(body, state.commentDrawer.quickImages); elements.quickCommentBody.value = ''; state.commentDrawer.quickImages.forEach((item) => URL.revokeObjectURL(item.preview)); state.commentDrawer.quickImages = []; renderDrawerImages(elements.quickImagePreview, []); elements.quickCommentDialog.close(); toast('评论已发布'); } catch (error) { toast(error.message, true); } });
+elements.drawerCommentList.addEventListener('click', async (event) => { const emoji = event.target.closest('[data-emoji]'); if (emoji) { const textarea = emoji.closest('.reply-form')?.querySelector('textarea'); if (textarea) { textarea.value += emoji.dataset.emoji; textarea.focus(); } return; } const button = event.target.closest('[data-comment-pin], [data-comment-verify]'); if (!button) return; const headers = getAdminHeaders(); if (!headers) return; try { const key = state.commentDrawer.goodsKey; if (button.dataset.commentVerify) { await api(`api/products/${encodeURIComponent(key)}/comments/${button.dataset.commentVerify}/verify`, { method: 'POST', headers, body: JSON.stringify({ verified: button.dataset.verified !== 'true' }) }); await fetchDrawerComments(); return; } const payload = await api(`api/products/${encodeURIComponent(key)}/comments/${button.dataset.commentPin}/pin`, { method: 'POST', headers, body: JSON.stringify({ pinned: button.dataset.pinned !== 'true' }) }); state.commentDrawer.comments.set(payload.comment.id, payload.comment); renderDrawerComments(); } catch (error) { forgetAdminKey(error); toast(error.message, true); } });
+elements.drawerCommentList.addEventListener('submit', async (event) => { const form = event.target.closest('.reply-form'); if (!form) return; event.preventDefault(); const body = form.querySelector('textarea').value.trim(); if (!body) return; const headers = state.adminVerified ? getAdminHeaders() : {}; try { const key = state.commentDrawer.goodsKey; const payload = await api(`api/products/${encodeURIComponent(key)}/comments/${form.dataset.replyComment}/replies`, { method: 'POST', headers: headers || {}, body: JSON.stringify({ author: elements.drawerCommentAuthor.value.trim(), body }) }); const comment = state.commentDrawer.comments.get(form.dataset.replyComment); if (comment) { comment.replies = [...(comment.replies || []), payload.reply]; renderDrawerComments(); } } catch (error) { toast(error.message, true); } });
+window.addEventListener('popstate', () => closeCommentDrawer(true));
 $('#sourceButton').addEventListener('click', () => openSources());
 
 $('#addSourceForm').addEventListener('submit', async (event) => {
@@ -1741,6 +2122,13 @@ if (savedAdminToken) {
 updateAdminProxyScanButton();
 loadState();
 connectEvents();
+setInterval(() => {
+  for (const [goodsKey, comments] of state.commentPreviews) {
+    if (comments.length < 2) continue;
+    state.commentCarouselIndex.set(goodsKey, (state.commentCarouselIndex.get(goodsKey) || 0) + 1);
+    updateCommentPreview(goodsKey);
+  }
+}, 5000);
 setInterval(() => {
   for (const card of document.querySelectorAll('.product-card .updated')) {
     const product = state.products.get(card.closest('.product-card')?.dataset.key);

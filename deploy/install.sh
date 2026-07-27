@@ -27,8 +27,17 @@ sudo install -o root -g root -m 0644 "$SOURCE_DIR/app.py" "$APP_DIR/app.py"
 sudo install -o root -g root -m 0644 "$SOURCE_DIR/static/index.html" "$APP_DIR/static/index.html"
 sudo install -o root -g root -m 0644 "$SOURCE_DIR/static/style.css" "$APP_DIR/static/style.css"
 sudo install -o root -g root -m 0644 "$SOURCE_DIR/static/app.js" "$APP_DIR/static/app.js"
+sudo install -o root -g root -m 0644 "$SOURCE_DIR/static/comments.html" "$APP_DIR/static/comments.html"
+sudo install -o root -g root -m 0644 "$SOURCE_DIR/static/comments.js" "$APP_DIR/static/comments.js"
 sudo install -o root -g root -m 0644 "$SOURCE_DIR/deploy/ldxp-scanner.service" /etc/systemd/system/ldxp-scanner.service
 sudo install -o root -g root -m 0755 "$SOURCE_DIR/tools/ldxp_scanctl.py" /usr/local/bin/ldxp-scanctl
+sudo install -d -o root -g root -m 0755 /usr/local/lib/ldxp
+sudo install -o root -g root -m 0755 "$SOURCE_DIR/tools/ldxp_ops.py" /usr/local/bin/ldxp-ops
+sudo install -o root -g root -m 0755 "$SOURCE_DIR/deploy/update-env-file.py" /usr/local/lib/ldxp/update-env-file.py
+sudo install -o root -g root -m 0644 "$SOURCE_DIR/deploy/ldxp-ops-completion.bash" /etc/bash_completion.d/ldxp-ops
+for command in ldxp-progress ldxp-pending ldxp-refresh-all ldxp-set-interval ldxp-refresh-category; do
+  sudo ln -sfn /usr/local/bin/ldxp-ops "/usr/local/bin/$command"
+done
 
 if [[ ! -f "$ENV_FILE" ]]; then
   sudo sh -c "umask 077; printf '%s\n' 'LDXP_HOST=127.0.0.1' 'LDXP_PORT=8765' 'LDXP_DB_PATH=/var/lib/ldxp-scanner/ldxp.db' 'LDXP_AUTO_SCAN_ENABLED=true' 'LDXP_SCAN_INTERVAL=900' 'LDXP_SOURCE_INTERVAL=15' 'LDXP_DISCOVERY_INTERVAL=21600' 'LDXP_PAGE_SIZE=300' 'LDXP_MAX_PAGES=20' 'LDXP_PAGE_DELAY=0.05' 'LDXP_REQUEST_TIMEOUT=12' 'LDXP_FAILOVER_PROXY_URL=http://127.0.0.1:7891' 'LDXP_DIRECT_ATTEMPTS=1' 'LDXP_PROXY_ATTEMPTS=3' 'LDXP_RETRY_DELAY=0.4' 'LDXP_SCDN_PROXY_POOL_ENABLED=false' 'LDXP_SCDN_PROXY_PAGE_URL=https://proxy.scdn.io/get_proxies.php' 'LDXP_SCDN_PROXY_PROTOCOL=http' 'LDXP_SCDN_PROXY_PAGE_SIZE=100' 'LDXP_SCDN_PROXY_CANDIDATES_PER_CYCLE=8' 'LDXP_SCDN_PROXY_ROUNDS_PER_CYCLE=8' 'LDXP_SCDN_PROXY_TIMEOUT=6' 'LDXP_PROXY_SOURCE_INTERVAL=0.25' 'PRICEAI_REQUEST_TIMEOUT=20' 'LDXP_LOCAL_UPLOAD_MAX_ITEMS=6000' > '$ENV_FILE'"

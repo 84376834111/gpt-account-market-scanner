@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#101a2f">
+  <title>商品评论 · LDXP 扫货台</title>
+  <link rel="stylesheet" href="style.css?v=20260726-comments">
+</head>
+<body class="comments-page">
+  <main class="comment-shell">
+    <a class="comment-back" href="./" onclick="if(history.length>1){event.preventDefault();history.back()}">← 返回商品列表</a>
+    <section id="commentProduct" class="comment-product"><p>正在读取商品信息…</p></section>
+    <section class="comment-panel">
+      <div class="comment-panel-heading"><div><small>PRODUCT COMMENTS</small><h1>商品评论</h1></div><div class="comment-header-controls"><button id="commentRefresh" type="button">刷新评论</button><label>管理员令牌 <input id="commentAdminToken" type="password" autocomplete="off" placeholder="输入后认证"></label><button id="commentAdminVerify" type="button">认证</button><span id="commentCount"></span></div></div>
+      <div id="commentMetric" class="comment-metric"></div>
+      <form id="commentForm" class="comment-form">
+        <div class="comment-form-row"><label><span>昵称</span><input id="commentAuthor" maxlength="40" placeholder="匿名用户"></label></div>
+        <div class="comment-avatar-row"><label class="comment-avatar-upload"><input id="commentAvatar" type="file" accept="image/png,image/jpeg"><span id="commentAvatarPreview" class="comment-avatar default-avatar">匿</span><em>上传头像</em><small>PNG/JPEG 将在本机压缩为小头像</small></label></div>
+        <label><span>评论内容（最多 200 字）</span><textarea id="commentBody" maxlength="200" placeholder="分享商品体验、注意事项或价格信息…"></textarea></label>
+        <div class="emoji-shortcuts"><button type="button" data-emoji="😀">😀</button><button type="button" data-emoji="👍">👍</button><button type="button" data-emoji="🎉">🎉</button><button type="button" data-emoji="🔥">🔥</button><button type="button" data-emoji="❤️">❤️</button></div>
+        <div class="comment-upload-row"><label class="comment-upload"><input id="commentImages" type="file" accept="image/png,image/jpeg" multiple><span>添加图片（PNG 将在本机转换为 JPG）</span><small>最多 5 张，每张上传后小于 900 KB</small></label><div id="commentImagePreview" class="comment-image-preview"></div></div>
+        <div class="score-fields">
+          <div data-score-field="product_score"><label><input type="checkbox"> 商品守约评分</label><span class="stars"></span></div>
+          <div data-score-field="shop_score"><label><input type="checkbox"> 商铺守约评分</label><span class="stars"></span></div>
+          <div data-score-field="experience_score"><label><input type="checkbox"> 使用体验评分</label><span class="stars"></span></div>
+        </div>
+        <button class="button primary" type="submit">发布评论</button>
+      </form>
+      <div id="commentList" class="comment-list" aria-live="polite"></div>
+    </section>
+  </main>
+  <div id="commentToast" class="toast" role="status" aria-live="polite"></div>
+  <script src="comments.js?v=20260726-comments" defer></script>
+</body>
+</html>

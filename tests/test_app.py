@@ -54,7 +54,7 @@ class ClassificationTests(unittest.TestCase):
         )
 
     def test_uses_only_title_and_prefers_specific_account_tiers(self):
-        self.assertEqual(classify_product("普通 API 额度卡", "Plus Team K12"), [])
+        self.assertEqual(classify_product("普通 API 额度卡", "Plus Team K12"), ["relay"])
         self.assertEqual(classify_product("GPT Free 可开 Plus 已接码"), ["free", "free_sms"])
         self.assertEqual(classify_product("GPT Team K12 成品"), ["k12"])
         self.assertEqual(classify_product("GPT BUGTEAM Team 账号"), ["bugteam"])
@@ -107,6 +107,15 @@ class ClassificationTests(unittest.TestCase):
         self.assertNotIn("sms", classify_product("GPT Plus 成品号 未接码"))
         self.assertIn("sms", classify_product("Codex长效接码美国实体卡"))
 
+    def test_classifies_relay_services_without_account_mail_or_sms_false_positives(self):
+        self.assertIn("relay", classify_product("Codex 官方中转 API 50刀额度"))
+        self.assertIn("relay", classify_product("Claude 1000刀额度兑换码"))
+        self.assertIn("relay", classify_product("老徐 Codex 中转站 10刀额度"))
+        self.assertNotIn("relay", classify_product("Outlook OAuth2 API 令牌号"))
+        self.assertNotIn("relay", classify_product("Codex 接码美国实卡 API 长效"))
+        self.assertNotIn("relay", classify_product("GPT Plus 成品账号可导入中转站"))
+        self.assertNotIn("relay", classify_product("K12 JSON 仅支持 Sub2API"))
+
     def test_ignores_generic_description(self):
         item = {
             "goods_key": "abc123",
@@ -114,7 +123,8 @@ class ClassificationTests(unittest.TestCase):
             "description": "支持 Claude、Gemini 和 Plus",
             "category": {"name": "Plus Team K12"},
         }
-        self.assertIsNone(product_from_api(item, "demo", "BugTeam Free 店"))
+        product = product_from_api(item, "demo", "BugTeam Free 店")
+        self.assertEqual(product["tags"], ["relay"])
 
 
 class SourceTests(unittest.TestCase):
@@ -429,9 +439,11 @@ class DatabaseTests(unittest.TestCase):
             self.db.upsert_product(self.product(stock=0))
         first = self.db.get_product("goods1")
         self.assertEqual(first["out_of_stock_since"], 100)
-        self.assertEqual(product_refresh_interval(first, 100), 4 * 60 * 60)
-        self.assertEqual(product_refresh_interval(first, 100 + 2 * 24 * 60 * 60), 6 * 60 * 60)
+        self.assertFalse(app.is_lazy_out_of_stock(first, 100))
+        self.assertEqual(product_refresh_interval(first, 100), 2 * 60 * 60)
+        self.assertTrue(app.is_lazy_out_of_stock(first, 100 + 24 * 60 * 60))
         self.assertEqual(product_refresh_interval(first, 100 + 8 * 24 * 60 * 60), 24 * 60 * 60)
+        self.assertEqual(app.lazy_refresh_due_at(first["last_seen"], 100), first["last_seen"] + 24 * 60 * 60)
 
         with patch("app.now_ts", return_value=200):
             self.db.upsert_product(self.product(stock=4))
@@ -469,6 +481,22 @@ class DatabaseTests(unittest.TestCase):
             [product["goods_key"] for product in self.db.list_product_page(search="link-search-key")["products"]],
             ["goods2"],
         )
+
+    def test_successfully_scanned_empty_source_uses_last_scan_as_watermark(self):
+        self.db.upsert_source("empty", "Empty shop", origin="unit-test")
+        with self.db.session() as db:
+            db.execute(
+                "UPDATE sources SET status = 'ok', last_scan = ?, updated_at = ? WHERE token = 'empty'",
+                (1_000, 1_000),
+            )
+
+        with patch("app.now_ts", return_value=1_000 + app.SCAN_INTERVAL - 1):
+            due_before = self.db.list_sources_due_for_scan(scheduled=True)
+        with patch("app.now_ts", return_value=1_000 + app.SCAN_INTERVAL):
+            due_at = self.db.list_sources_due_for_scan(scheduled=True)
+
+        self.assertNotIn("empty", [source["token"] for source in due_before])
+        self.assertIn("empty", [source["token"] for source in due_at])
 
     def test_pages_products_by_shop_link_with_exact_source_lookup(self):
         self.db.upsert_source("second", "Second shop", origin="unit-test")
@@ -513,6 +541,31 @@ class DatabaseTests(unittest.TestCase):
             [item["goods_key"] for item in self.db.get_visible_products(["second", "missing", "second"])],
             ["second"],
         )
+
+    def test_off_shelf_products_are_exclusive_to_the_off_shelf_category(self):
+        self.db.upsert_product(self.product())
+        self.db.upsert_product({**self.product(), "goods_key": "removed", "name": "Claude Pro removed"})
+        self.db.mark_product_off_shelf("removed", "item not found")
+
+        normal = self.db.list_product_page(stock_only=False)
+        off_shelf = self.db.list_product_page(category="off_shelf", stock_only=True)
+        stats = self.db.stats()
+
+        self.assertEqual([item["goods_key"] for item in normal["products"]], ["goods1"])
+        self.assertEqual([item["goods_key"] for item in off_shelf["products"]], ["removed"])
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual(stats["category_counts"]["off_shelf"], 1)
+        self.assertEqual(stats["category_counts"]["claude"], 1)
+
+    def test_all_off_shelf_source_is_excluded_from_manual_and_scheduled_scans(self):
+        self.db.upsert_product(self.product())
+        self.db.mark_product_off_shelf("goods1", "item not found")
+
+        manual_tokens = [source["token"] for source in self.db.list_sources_due_for_scan(scheduled=False)]
+        scheduled_tokens = [source["token"] for source in self.db.list_sources_due_for_scan(scheduled=True)]
+
+        self.assertNotIn("demo", manual_tokens)
+        self.assertNotIn("demo", scheduled_tokens)
 
     def test_state_snapshot_omits_products_by_default(self):
         self.db.upsert_product(self.product())
@@ -602,9 +655,9 @@ class DatabaseTests(unittest.TestCase):
 
         result = self.db.reclassify_products()
 
-        self.assertEqual(result, {"updated": 1, "deactivated": 1})
+        self.assertEqual(result, {"updated": 2, "deactivated": 0})
         self.assertEqual(self.db.get_product("goods1")["tags"], ["free"])
-        self.assertIsNone(self.db.get_product("goods2"))
+        self.assertEqual(self.db.get_product("goods2")["tags"], ["relay"])
 
     def test_ingests_complete_browser_local_source_and_removes_missing_products(self):
         self.db.upsert_product(self.product())
@@ -632,7 +685,8 @@ class DatabaseTests(unittest.TestCase):
 
         self.assertEqual(result["matched"], 1)
         self.assertEqual(result["removed"], 1)
-        self.assertIsNone(self.db.get_product("goods1"))
+        self.assertTrue(self.db.get_product("goods1")["off_shelf"])
+        self.assertEqual(self.db.get_product("goods1")["stock_count"], 0)
         self.assertEqual(self.db.get_product("goods2")["stock_count"], 5)
         source = self.db.get_source("demo")
         self.assertEqual(source["name"], "浏览器本地店铺")
@@ -671,8 +725,42 @@ class DatabaseTests(unittest.TestCase):
 
         removed = service.ingest_local_products("demo", "演示店", [], {"goods1"})
         self.assertEqual(removed["removed"], 1)
-        self.assertIsNone(self.db.get_product("goods1"))
+        self.assertTrue(self.db.get_product("goods1")["off_shelf"])
+        self.assertEqual(self.db.get_product("goods1")["stock_count"], 0)
         self.assertIsNotNone(self.db.get_product("goods2"))
+
+    def test_user_refresh_claim_prioritizes_products_not_scanned_recently(self):
+        old = self.product()
+        recent = {**self.product(), "goods_key": "goods2", "name": "Claude Pro 2"}
+        self.db.upsert_product(old)
+        self.db.upsert_product(recent)
+        with self.db.session() as db:
+            db.execute("UPDATE products SET last_seen = 10 WHERE goods_key = 'goods1'")
+            db.execute("UPDATE products SET last_seen = 20 WHERE goods_key = 'goods2'")
+        state = app.AppState(
+            self.db, EventHub(), ScannerService(self.db, EventHub(), auto_scan_enabled=False)
+        )
+
+        batch = state.claim_user_refresh_batch({"stock_only": False})
+
+        self.assertEqual([item["goods_key"] for item in batch["products"]], ["goods1", "goods2"])
+        self.assertEqual(batch["offset"], 0)
+
+    def test_browser_factory_claims_pending_sources_without_duplicates(self):
+        self.db.upsert_source("second", "Second", origin="unit-test")
+        service = ScannerService(self.db, EventHub(), auto_scan_enabled=False)
+        service._set_pending_scan_sources([self.db.get_source("demo"), self.db.get_source("second")])
+
+        first = service.claim_browser_factory_batch(multiplier=99)
+        second = service.claim_browser_factory_batch()
+
+        self.assertEqual({source["token"] for source in first["sources"]}, {"demo", "second"})
+        self.assertEqual(first["multiplier"], 5)
+        self.assertEqual(first["limit"], 120)
+        self.assertEqual(second["sources"], [])
+        service.complete_browser_factory_lease("demo", first["lease_id"])
+        self.assertFalse(service._browser_factory_leased("demo"))
+        self.assertNotIn("demo", service._pending_scan_sources)
 
     def test_ingests_browser_products_while_server_scan_is_active(self):
         self.db.upsert_product(self.product())
@@ -1011,7 +1099,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(event["event"], "product_refresh")
         self.assertEqual(event["data"]["product"]["goods_key"], "goods1")
 
-    def test_single_product_detail_without_stock_preserves_known_stock(self):
+    def test_single_product_detail_without_stock_keeps_stock_unknown(self):
         self.db.upsert_product(self.product(stock=3))
         service = ScannerService(self.db, EventHub())
         ldxp = Mock()
@@ -1033,7 +1121,7 @@ class DatabaseTests(unittest.TestCase):
             _, product = service.refresh_product("goods1")
 
         self.assertEqual(product["price"], 8.5)
-        self.assertEqual(product["stock_count"], 3)
+        self.assertEqual(product["stock_count"], -1)
         self.assertTrue(product["in_stock"])
 
     def test_syncs_priceai_public_snapshot_without_entering_shop_scan_queue(self):
@@ -1075,14 +1163,62 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("plus", product["tags"])
         self.assertEqual(
             [source["token"] for source in self.db.list_sources_due_for_scan(scheduled=False)],
-            ["demo"],
+            ["demo", PRICEAI_SOURCE_TOKEN],
         )
-
         with patch.object(service, "_read_json_url", side_effect=[latest, {"products": []}]):
             removed = service.sync_priceai_snapshot()
         self.assertEqual(removed["removed"], 1)
         self.assertIsNone(self.db.get_product("priceai:priceai-offer-1"))
 
+    def test_snapshot_link_scan_marks_a_missing_listing_off_shelf(self):
+        self.db.upsert_source(
+            "snapshot-demo", "Directory snapshot", origin="unit-test", source_kind="snapshot"
+        )
+        self.db.upsert_product(
+            {
+                **self.product(stock=999),
+                "source_token": "snapshot-demo",
+                "source_name": "Directory snapshot",
+                "link": "https://pay.ldxp.cn/item/goods1",
+            }
+        )
+        service = ScannerService(self.db, EventHub(), auto_scan_enabled=False)
+        client = Mock()
+        client.base_url = app.LDXP_BASE_URL
+        client.goods_info.side_effect = LDXPError("goods not found")
+
+        matched, changed = service._scan_source("snapshot-demo", client=client)
+
+        product = self.db.get_product("goods1")
+        self.assertEqual((matched, changed), (1, 1))
+        self.assertTrue(product["off_shelf"])
+        self.assertFalse(product["in_stock"])
+        self.assertEqual(product["stock_count"], 0)
+
+    def test_snapshot_link_scan_keeps_live_listing_but_clears_directory_stock_placeholder(self):
+        self.db.upsert_source(
+            "snapshot-demo", "Directory snapshot", origin="unit-test", source_kind="snapshot"
+        )
+        self.db.upsert_product(
+            {
+                **self.product(stock=999),
+                "source_token": "snapshot-demo",
+                "source_name": "Directory snapshot",
+                "link": "https://pay.ldxp.cn/item/goods1",
+            }
+        )
+        service = ScannerService(self.db, EventHub(), auto_scan_enabled=False)
+        client = Mock()
+        client.base_url = app.LDXP_BASE_URL
+        client.goods_info.return_value = {"goods_key": "goods1", "name": "Claude Pro"}
+
+        matched, changed = service._scan_source("snapshot-demo", client=client)
+
+        product = self.db.get_product("goods1")
+        self.assertEqual((matched, changed), (1, 1))
+        self.assertFalse(product["off_shelf"])
+        self.assertTrue(product["in_stock"])
+        self.assertEqual(product["stock_count"], -1)
 
 class SourcePermissionApiTests(unittest.TestCase):
     def setUp(self):
